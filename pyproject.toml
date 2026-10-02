@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agent-harness"
+version = "0.1.0"
+description = "A lightweight, modular, application-agnostic agent harness."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["pydantic>=2.6"]
+
+[project.optional-dependencies]
+litellm = ["litellm>=1.40", "python-dotenv>=1.0"]
+# For a local OpenAI-compatible server (Ollama, vLLM, llama.cpp, LM Studio, ...) via LocalProvider.
+local = ["instructor>=1.0", "openai>=1.0", "python-dotenv>=1.0"]
+dev = ["pytest>=8", "pytest-asyncio>=0.23"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agent_harness"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+# Emitted by litellm's own typed dicts when pydantic builds their schema; not ours.
+filterwarnings = ["ignore:Item .* is using the `ReadOnly` qualifier:UserWarning"]
