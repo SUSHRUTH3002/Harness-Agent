@@ -4,8 +4,8 @@
 |---|---|---|---|
 | 0 | Repository analysis, architecture, plan | **Done — reviewed** | — |
 | 1 | Core agent harness | **Done — awaiting review** (91 tests passing) | Yes |
-| 2 | Reliability & execution control | Not started | Yes |
-| 3 | Context management | Not started | Yes |
+| 2 | Reliability & execution control | **Done** (retry/timeout middleware, cancellation, transcript repair, repeated-call guard) | Yes |
+| 3 | Context management | **Done** (token budget, ordered prompt sections, oldest-group reduction, overflow) | Yes |
 | 4 | Tool execution pipeline (hooks) | Not started | Yes |
 | 5 | Event system | Not started | Yes |
 | 6 | Observability | Not started | Yes |

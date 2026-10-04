@@ -53,7 +53,7 @@ cp .env.example .env        # then set HARNESS_MODEL and the key for that provid
 .venv/bin/python main.py -q "What is 17 * 23?"                          # answer only
 ```
 
-`main.py` reads `.env`. Variables already set in your shell take precedence, and blank entries are ignored. Before sending anything, it checks that the selected model's key is present. See [.env.example](.env.example) for all settings (`HARNESS_TEMPERATURE`, `HARNESS_MAX_TOKENS`, `HARNESS_MAX_STEPS`, `HARNESS_TIMEOUT`, `HARNESS_API_BASE`, `HARNESS_API_KEY`).
+`main.py` reads `.env`. Variables already set in your shell take precedence, and blank entries are ignored. Before sending anything, it checks that the selected model's key is present. See [.env.example](.env.example) for all settings, including reliability (`HARNESS_MAX_RETRIES`, `HARNESS_MAX_EXECUTION_TIME`, `HARNESS_REPEAT_CALL_THRESHOLD`/`_ACTION`) and context budgeting (`HARNESS_MAX_CONTEXT_TOKENS`, `HARNESS_RESERVED_OUTPUT_TOKENS`).
 
 | Provider | Model string | Env var |
 |---|---|---|

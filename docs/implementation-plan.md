@@ -100,6 +100,13 @@ Status: Phase 0 proposal. Each phase ends with a **validation gate**: unit tests
 
 **Gate question:** is middleware enough, or do we need the Phase 4 hook system earlier? The expected answer is middleware.
 
+### Phase 2 outcome
+
+- **Implemented**: `cancellation.py` (`CancellationToken`), `retry.py` (`RetryPolicy`, `ResilientLLMProvider`, composed by the caller -- not auto-wrapped by `Runtime`), per-agent `llm_timeout`/`tool_timeout`/`max_execution_time` on `AgentLimits`, `Runtime.start()` → `Execution` (`.cancel()`/`.wait()`, `run()` is now `await self.start(...).wait()`), transcript repair on cancel/timeout/failure (`_repair_transcript`), and the repeated-call guard (`AgentLoop._check_repeated_calls`, state kept in `state.extensions["repeat_guard"]`).
+- **No tests written** (explicit instruction); verified by hand via ad hoc scripts covering: retry-then-succeed, non-retryable failing immediately, `max_steps`, repeat-guard `warn` and `stop`, cancellation mid-run, per-tool timeout, and `max_execution_time`. All behaved as designed.
+- **Deviations from the design sketch:** `llm_timeout` is enforced per-agent inside the loop (`AgentLoop._generate`), not only via a provider wrapper -- a provider can't see which `Agent` is running, so a per-agent override has to live where `agent` is in scope. `CancelledError` (the design.md sketch's planned `HarnessError` subclass) was not added; real `asyncio.CancelledError` is used directly and converted to `RunStatus.CANCELLED` at the `Runtime` boundary, to avoid two "CancelledError" names meaning different things.
+- **main.py wiring:** `HARNESS_MAX_RETRIES`, `HARNESS_MAX_EXECUTION_TIME`, `HARNESS_REPEAT_CALL_THRESHOLD`/`_ACTION`; `HARNESS_TIMEOUT` now also feeds `agent.limits.llm_timeout`. Ctrl-C during `ask()` triggers `Execution.cancel()` (verified against a real SIGINT in a subprocess: a clean `RunResult(status=cancelled)`, not a crash).
+
 ## Phase 3: Context Management
 
 **Build:**
@@ -111,6 +118,13 @@ Status: Phase 0 proposal. Each phase ends with a **validation gate**: unit tests
 - A `context.created` metadata record (token estimate per section, which follows TF's usage attribution).
 
 **Tests:** section ordering, estimates, reduction preserves tool pairing and the system prompt, overflow is raised when reduction cannot fit.
+
+### Phase 3 outcome
+
+- **Implemented** in `context.py`: `TokenCounter` protocol + `CharTokenCounter` (chars/4), `PromptSection` (ordered, defaults to one "instructions" section), and budgeting in `DefaultContextManager` (same class, extended in place per the design doc, not a new class). Reduction drops the *oldest* complete tool-call group (`_segment_history` pairs an assistant tool-call message with the tool messages answering it) until `max_context_tokens - reserved_output_tokens` is met; index 0 (the first message) is never eligible. Raises `ContextError(CONTEXT_OVERFLOW)` if it still doesn't fit. `max_context_tokens`/`reserved_output_tokens` live on `AgentLimits`, not the `ContextManager` constructor, to stay consistent with how every other limit is per-agent.
+- **No tests written** (explicit instruction); verified by hand: no-budget (nothing dropped), generous budget (nothing dropped), tight budget (drops oldest groups, keeps first and last message), and an impossible budget (raises `ContextError` with `groups_dropped` in `details`).
+- **Deviations:** no formal `context.created` event/record (Phase 5's event bus doesn't exist yet) -- the same information is attached to `LLMRequest.metadata["context"]` and logged at DEBUG instead. A tiktoken-style counter was not built (optional, not requested); any real tokenizer can be swapped in via the `token_counter=` constructor argument.
+- **main.py wiring:** `HARNESS_MAX_CONTEXT_TOKENS` (blank = Phase 1 behavior, unlimited), `HARNESS_RESERVED_OUTPUT_TOKENS`.
 
 ## Phase 4: Tool Execution Pipeline
 
