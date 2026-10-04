@@ -2,8 +2,9 @@
 
 initialize → prepare (registry, tool setup) → agent loop → completion → cleanup
 
-`run()` does not raise for agent-level failures; they are reported in the
-returned `RunResult`. It raises only for caller errors such as invalid input.
+`run()`/`start()` never raise for agent-level failures; they are reported in
+the returned `RunResult`. They raise only for caller errors such as invalid
+input.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ from typing import Sequence
 from pydantic import BaseModel
 
 from agent_harness.agent import Agent
+from agent_harness.cancellation import CancellationToken
 from agent_harness.context import ContextManager, DefaultContextManager
 from agent_harness.errors import ErrorCode, ErrorInfo, HarnessError, ValidationError
 from agent_harness.executor import SequentialToolExecutor, ToolExecutor
@@ -24,6 +26,7 @@ from agent_harness.loop import AgentLoop, LoopDependencies
 from agent_harness.messages import Message, short_id, utcnow
 from agent_harness.registry import ToolRegistry
 from agent_harness.state import AgentState, RunStatus
+from agent_harness.tools import ToolResult
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +49,49 @@ class RunResult(BaseModel):
         return self.status is RunStatus.COMPLETED
 
 
+def _repair_transcript(state: AgentState, code: str, message: str) -> None:
+    """Give every still-pending tool call a synthetic result.
+
+    Called whenever a run ends abnormally (cancelled, timed out, or failed)
+    partway through a tool batch, so the saved transcript always has exactly
+    one result per call and stays valid to resend to any provider.
+    """
+    for call in state.pending_tool_calls():
+        result = ToolResult.error(call.id, call.name, message, code)
+        state.append(Message.tool(result.call_id, result.content, name=result.name, is_error=True))
+        state.tool_results.append(result)
+
+
+class Execution:
+    """A running (or finished) agent run, with the ability to cancel it.
+
+    Cancellation is cooperative: `cancel()` both sets the run's
+    `CancellationToken` (checked between loop steps, and exposed to tools via
+    `ToolContext.cancel` for code that can't be interrupted by task
+    cancellation, e.g. a sync tool body in a worker thread) and cancels the
+    underlying asyncio task (interrupting whatever is currently awaited, such
+    as an in-flight LLM or tool call). Either path ends the run as
+    `RunStatus.CANCELLED`, never with a raised `CancelledError` -- see
+    `Runtime._execute`.
+    """
+
+    def __init__(self, task: asyncio.Task[RunResult], cancel_token: CancellationToken, execution_id: str) -> None:
+        self._task = task
+        self._cancel_token = cancel_token
+        self.execution_id = execution_id
+
+    def cancel(self, reason: str | None = None) -> None:
+        self._cancel_token.cancel(reason)
+        self._task.cancel()
+
+    @property
+    def done(self) -> bool:
+        return self._task.done()
+
+    async def wait(self) -> RunResult:
+        return await self._task
+
+
 class Runtime:
     def __init__(
         self,
@@ -62,12 +108,27 @@ class Runtime:
         self.tool_executor = tool_executor or SequentialToolExecutor()
         self.loop = loop or AgentLoop()
 
-    async def run(self, agent: Agent, input: RunInput | None = None, *, state: AgentState | None = None) -> RunResult:
+    def start(self, agent: Agent, input: RunInput | None = None, *, state: AgentState | None = None) -> Execution:
+        """Start a run without waiting for it, returning a cancellable handle."""
         resumed = state is not None
         state = self._prepare_state(agent, input, state)
+        cancel_token = CancellationToken()
+        task = asyncio.ensure_future(self._execute(agent, state, cancel_token, resumed=resumed))
+        return Execution(task, cancel_token, state.execution_id)
+
+    async def run(self, agent: Agent, input: RunInput | None = None, *, state: AgentState | None = None) -> RunResult:
+        return await self.start(agent, input, state=state).wait()
+
+    def run_sync(self, agent: Agent, input: RunInput | None = None, *, state: AgentState | None = None) -> RunResult:
+        return asyncio.run(self.run(agent, input, state=state))
+
+    async def _execute(
+        self, agent: Agent, state: AgentState, cancel_token: CancellationToken, *, resumed: bool
+    ) -> RunResult:
         registry = ToolRegistry(agent.tools)
         deps = LoopDependencies(
-            llm=self.llm, context=self.context_manager, executor=self.tool_executor, registry=registry
+            llm=self.llm, context=self.context_manager, executor=self.tool_executor, registry=registry,
+            cancel=cancel_token,
         )
         exec_id = short_id(state.execution_id)
         logger.info(
@@ -82,17 +143,40 @@ class Runtime:
             await registry.setup()
             logger.debug("exec=%s tools ready: %s", exec_id, ", ".join(registry.names()) or "none")
             try:
-                await self.loop.run(agent, state, deps)
+                if agent.limits.max_execution_time is not None:
+                    async with asyncio.timeout(agent.limits.max_execution_time):
+                        await self.loop.run(agent, state, deps)
+                else:
+                    await self.loop.run(agent, state, deps)
             finally:
                 await registry.teardown()
+        except asyncio.CancelledError:
+            logger.warning("exec=%s run cancelled at step %d%s", exec_id, state.step,
+                            f": {cancel_token.reason}" if cancel_token.reason else "")
+            state.status = RunStatus.CANCELLED
+            state.error = ErrorInfo(code=ErrorCode.CANCELLED, message=cancel_token.reason or "run was cancelled",
+                                     type="CancelledError")
+            _repair_transcript(state, ErrorCode.CANCELLED, "Run was cancelled before this tool call completed.")
+        except TimeoutError:
+            logger.warning("exec=%s run timed out at step %d after %.0fs (max_execution_time)",
+                            exec_id, state.step, agent.limits.max_execution_time)
+            state.status = RunStatus.TIMED_OUT
+            state.error = ErrorInfo(
+                code=ErrorCode.TIMEOUT,
+                message=f"Run exceeded max_execution_time ({agent.limits.max_execution_time:.0f}s).",
+                type="TimedOut",
+            )
+            _repair_transcript(state, ErrorCode.TIMEOUT, "Run timed out before this tool call completed.")
         except HarnessError as exc:
             logger.error("exec=%s run failed at step %d: [%s] %s", exec_id, state.step, exc.code, exc.message)
             state.status = RunStatus.FAILED
             state.error = ErrorInfo.from_exception(exc)
+            _repair_transcript(state, exc.code, "Run failed before this tool call completed.")
         except Exception as exc:
             logger.exception("exec=%s run failed at step %d with an unexpected error", exec_id, state.step)
             state.status = RunStatus.FAILED
             state.error = ErrorInfo.from_exception(exc)
+            _repair_transcript(state, ErrorCode.EXECUTION_ERROR, "Run failed before this tool call completed.")
         state.finished_at = utcnow()
         duration = time.monotonic() - started
 
@@ -114,9 +198,6 @@ class Runtime:
             duration=duration,
             state=state,
         )
-
-    def run_sync(self, agent: Agent, input: RunInput | None = None, *, state: AgentState | None = None) -> RunResult:
-        return asyncio.run(self.run(agent, input, state=state))
 
     @staticmethod
     def _normalize_input(input: RunInput | None) -> list[Message]:

@@ -18,6 +18,7 @@ from typing import Annotated, Any, Callable, get_args, get_origin, get_type_hint
 from pydantic import BaseModel, ConfigDict, Field, create_model
 from pydantic import ValidationError as PydanticValidationError
 
+from agent_harness.cancellation import CancellationToken
 from agent_harness.errors import ErrorCode, ValidationError
 from agent_harness.llm import ToolSchema
 
@@ -37,11 +38,15 @@ class ToolAnnotations(BaseModel):
 class ToolContext(BaseModel):
     """What a tool may see about the execution it runs in. Never the runtime itself."""
 
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     execution_id: str
     agent_id: str
     call_id: str
     tool_name: str
     step: int
+    # Cooperative cancellation signal (see cancellation.py). 
+    cancel: CancellationToken = Field(default_factory=CancellationToken)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 

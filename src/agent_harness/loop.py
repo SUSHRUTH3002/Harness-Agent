@@ -6,15 +6,18 @@ Exceptions from the LLM propagate to the Runtime, which records them.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from agent_harness.agent import Agent
+from agent_harness.cancellation import CancellationToken
 from agent_harness.context import ContextManager
-from agent_harness.errors import ErrorCode, ErrorInfo
+from agent_harness.errors import ErrorCode, ErrorInfo, LLMError
 from agent_harness.executor import ToolExecutionContext, ToolExecutor
-from agent_harness.llm import FinishReason, LLMProvider, LLMResponse
+from agent_harness.llm import FinishReason, LLMProvider, LLMRequest, LLMResponse
 from agent_harness.messages import Message, ToolCall, preview, short_id
 from agent_harness.registry import ToolRegistry
 from agent_harness.state import AgentState, RunStatus
@@ -38,6 +41,15 @@ class LoopDependencies:
     context: ContextManager
     executor: ToolExecutor
     registry: ToolRegistry
+    cancel: CancellationToken = field(default_factory=CancellationToken)
+
+
+def _tool_call_signature(calls: list[ToolCall]) -> frozenset[str]:
+    """A step's tool calls, reduced to (name, canonical arguments) pairs for repeat detection."""
+    return frozenset(
+        f"{c.name}:{json.dumps(c.arguments, sort_keys=True) if c.arguments is not None else c.raw_arguments}"
+        for c in calls
+    )
 
 
 class AgentLoop:
@@ -49,10 +61,11 @@ class AgentLoop:
         pending = state.pending_tool_calls()
         if pending:
             logger.info("exec=%s resuming: executing %d pending tool call(s) first", exec_id, len(pending))
-            await self._execute_tools(pending, state, deps)
+            await self._execute_tools(pending, state, deps, agent)
 
         steps_this_run = 0
         while True:
+            deps.cancel.raise_if_cancelled()
             if steps_this_run >= agent.limits.max_steps:
                 logger.warning("exec=%s stopped: max_steps=%d reached", exec_id, agent.limits.max_steps)
                 state.status = RunStatus.MAX_STEPS
@@ -67,8 +80,8 @@ class AgentLoop:
                          len(request.messages), len(request.tools))
             started = time.perf_counter()
 
-            response = await deps.llm.generate(request)
-        
+            response = await self._generate(agent, deps, request)
+
             state.usage = state.usage + response.usage
             calls = response.message.tool_calls
 
@@ -96,7 +109,76 @@ class AgentLoop:
                 return state
 
             state.partial_output = ""
-            await self._execute_tools(calls, state, deps)
+            await self._execute_tools(calls, state, deps, agent)
+            if self._check_repeated_calls(agent, state, calls):
+                return state
+
+    async def _generate(self, agent: Agent, deps: LoopDependencies, request: LLMRequest) -> LLMResponse:
+        """Call the LLM, honoring `agent.limits.llm_timeout` if set.
+
+        This is a hard per-agent cap, separate from any retry/timeout a provider
+        is itself wrapped with (e.g. `ResilientLLMProvider`); it never retries.
+        """
+        if agent.limits.llm_timeout is None:
+            return await deps.llm.generate(request)
+        try:
+            async with asyncio.timeout(agent.limits.llm_timeout):
+                return await deps.llm.generate(request)
+        except asyncio.CancelledError:
+            raise
+        except TimeoutError as exc:
+            raise LLMError(
+                f"LLM call exceeded agent.limits.llm_timeout ({agent.limits.llm_timeout:.0f}s)",
+                code=ErrorCode.TIMEOUT,
+            ) from exc
+
+    def _check_repeated_calls(self, agent: Agent, state: AgentState, calls: list[ToolCall]) -> bool:
+        """Detect the model issuing the same tool call(s) repeatedly. Returns True if the run stopped.
+
+        Tracked as a signature of the *previous* step's calls against this step's,
+        stored in `state.extensions` (never a dedicated field -- see design.md D on extensions).
+        """
+        threshold = agent.limits.repeat_call_threshold
+        if threshold is None:
+            return False
+        exec_id = short_id(state.execution_id)
+        guard = state.extensions.setdefault("repeat_guard", {"signature": None, "count": 0})
+        signature = sorted(_tool_call_signature(calls))
+        if signature == guard["signature"]:
+            guard["count"] += 1
+        else:
+            guard["signature"] = signature
+            guard["count"] = 1
+        if guard["count"] < threshold:
+            return False
+
+        names = ", ".join(sorted({c.name for c in calls}))
+        if agent.limits.repeat_call_action == "stop":
+            logger.error(
+                "exec=%s step=%d stopped: %s called with identical arguments %d times in a row",
+                exec_id, state.step, names, guard["count"],
+            )
+            state.status = RunStatus.FAILED
+            state.error = ErrorInfo(
+                code=ErrorCode.REPEATED_TOOL_CALL,
+                message=f"'{names}' was called with identical arguments {guard['count']} times in a row.",
+                type="RepeatedToolCall",
+                details={"count": guard["count"], "tools": sorted({c.name for c in calls})},
+            )
+            return True
+
+        logger.warning(
+            "exec=%s step=%d %s called with identical arguments %d times in a row; reminding the model",
+            exec_id, state.step, names, guard["count"],
+        )
+        state.append(
+            Message.user(
+                f"You have called {names} with the exact same arguments {guard['count']} times in a row. "
+                "If you already have the information you need, use it to answer now instead of calling it again.",
+                metadata={"source": "harness", "reason": "repeated_tool_call"},
+            )
+        )
+        return False
 
     def _continue_after_truncation(self, agent: Agent, state: AgentState, response: LLMResponse) -> bool:
         """Record a cut-off response and decide whether to ask the model to continue.
@@ -142,11 +224,19 @@ class AgentLoop:
         state.append(Message.user(prompt, metadata={"source": "harness", "reason": "output_truncated"}))
         return True
 
-    async def _execute_tools(self, calls: list[ToolCall], state: AgentState, deps: LoopDependencies) -> None:
+    async def _execute_tools(
+        self, calls: list[ToolCall], state: AgentState, deps: LoopDependencies, agent: Agent
+    ) -> None:
         exec_id = short_id(state.execution_id)
         logger.info("exec=%s step=%d executing %d tool call(s): %s", exec_id, state.step, len(calls),
                     ", ".join(c.name for c in calls))
-        context = ToolExecutionContext(execution_id=state.execution_id, agent_id=state.agent_id, step=state.step)
+        context = ToolExecutionContext(
+            execution_id=state.execution_id,
+            agent_id=state.agent_id,
+            step=state.step,
+            cancel=deps.cancel,
+            default_tool_timeout=agent.limits.tool_timeout,
+        )
         results = await deps.executor.execute(calls, deps.registry, context)
 
         # Enforce the executor contract so the transcript is always valid for providers.

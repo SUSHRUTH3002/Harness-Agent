@@ -7,7 +7,14 @@ import logging as _logging
 _logging.getLogger(__name__).addHandler(_logging.NullHandler())
 
 from agent_harness.agent import Agent, AgentLimits
-from agent_harness.context import ContextManager, DefaultContextManager
+from agent_harness.cancellation import CancellationToken
+from agent_harness.context import (
+    CharTokenCounter,
+    ContextManager,
+    DefaultContextManager,
+    PromptSection,
+    TokenCounter,
+)
 from agent_harness.errors import (
     ContextError,
     ErrorCode,
@@ -24,7 +31,8 @@ from agent_harness.llm import FinishReason, LLMProvider, LLMRequest, LLMResponse
 from agent_harness.loop import AgentLoop, LoopDependencies
 from agent_harness.messages import Message, Role, TextPart, ToolCall, ToolCallPart
 from agent_harness.registry import ToolRegistry
-from agent_harness.runtime import RunResult, Runtime
+from agent_harness.retry import RetryPolicy, ResilientLLMProvider
+from agent_harness.runtime import Execution, RunResult, Runtime
 from agent_harness.state import AgentState, RunStatus
 from agent_harness.tools import FunctionTool, Tool, ToolAnnotations, ToolContext, ToolResult, tool
 
@@ -33,11 +41,14 @@ __all__ = [
     "AgentLimits",
     "AgentLoop",
     "AgentState",
+    "CancellationToken",
+    "CharTokenCounter",
     "ContextError",
     "ContextManager",
     "DefaultContextManager",
     "ErrorCode",
     "ErrorInfo",
+    "Execution",
     "ExecutionError",
     "FinishReason",
     "FunctionTool",
@@ -49,6 +60,9 @@ __all__ = [
     "LLMResponse",
     "LoopDependencies",
     "Message",
+    "PromptSection",
+    "ResilientLLMProvider",
+    "RetryPolicy",
     "Role",
     "RunResult",
     "RunStatus",
@@ -66,6 +80,7 @@ __all__ = [
     "ToolRegistry",
     "ToolResult",
     "ToolSchema",
+    "TokenCounter",
     "Usage",
     "ValidationError",
     "tool",

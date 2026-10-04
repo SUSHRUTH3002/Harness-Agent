@@ -21,7 +21,16 @@ from pathlib import Path
 import litellm
 from dotenv import dotenv_values
 
-from agent_harness import Agent, AgentLimits, AgentState, Role, RunResult, Runtime
+from agent_harness import (
+    Agent,
+    AgentLimits,
+    AgentState,
+    ResilientLLMProvider,
+    RetryPolicy,
+    Role,
+    RunResult,
+    Runtime,
+)
 from agent_harness.providers.litellm_provider import LiteLLMProvider
 from agent_harness.providers.local_provider import LocalProvider
 from agent_harness.testing import calculator, get_weather, web_search
@@ -137,6 +146,11 @@ def load_config() -> dict:
     max_tokens = _number("HARNESS_MAX_TOKENS", int)
     if max_tokens:
         settings["max_tokens"] = max_tokens
+
+    repeat_action = _env("HARNESS_REPEAT_CALL_ACTION") or "warn"
+    if repeat_action not in ("warn", "stop"):
+        raise ConfigError(f"HARNESS_REPEAT_CALL_ACTION must be 'warn' or 'stop', got {repeat_action!r}")
+
     return {
         "model": model,
         "local": local,
@@ -145,6 +159,12 @@ def load_config() -> dict:
         "timeout": _number("HARNESS_TIMEOUT", float, 120.0),
         "max_steps": _number("HARNESS_MAX_STEPS", int, 15),
         "settings": settings,
+        "max_retries": _number("HARNESS_MAX_RETRIES", int, 3),
+        "max_execution_time": _number("HARNESS_MAX_EXECUTION_TIME", float),
+        "repeat_call_threshold": _number("HARNESS_REPEAT_CALL_THRESHOLD", int, 3),
+        "repeat_call_action": repeat_action,
+        "max_context_tokens": _number("HARNESS_MAX_CONTEXT_TOKENS", int),
+        "reserved_output_tokens": _number("HARNESS_RESERVED_OUTPUT_TOKENS", int, 1024),
     }
 
 
@@ -158,12 +178,23 @@ def build(config: dict) -> tuple[Runtime, Agent]:
         provider = LiteLLMProvider(
             config["model"], api_base=config["api_base"], api_key=config["api_key"], timeout=config["timeout"]
         )
+    
+    # Retries live outside the loop entirely, this wrapper is the only thing that changes when retry behavior changes. (refer retry.py)
+    provider = ResilientLLMProvider(provider, policy=RetryPolicy(max_retries=config["max_retries"]))
     agent = Agent(
         name="assistant",
         instructions=INSTRUCTIONS,
         tools=[calculator, get_weather, web_search, fetch_resource_metadata],
         model_settings=config["settings"],
-        limits=AgentLimits(max_steps=config["max_steps"]),
+        limits=AgentLimits(
+            max_steps=config["max_steps"],
+            max_execution_time=config["max_execution_time"],
+            llm_timeout=config["timeout"],
+            repeat_call_threshold=config["repeat_call_threshold"],
+            repeat_call_action=config["repeat_call_action"],
+            max_context_tokens=config["max_context_tokens"],
+            reserved_output_tokens=config["reserved_output_tokens"],
+        ),
     )
     return Runtime(provider), agent
 
@@ -189,7 +220,13 @@ def print_summary(result: RunResult) -> None:
 
 async def ask(runtime: Runtime, agent: Agent, question: str, state: AgentState | None, quiet: bool) -> RunResult:
     start = len(state.messages) + 1 if state else 1  # skip the user's own message
-    result = await runtime.run(agent, question, state=state)
+    execution = runtime.start(agent, question, state=state)
+    try:
+        result = await execution.wait()
+    except KeyboardInterrupt:
+        logger.warning("exec=%s cancelling on Ctrl-C", execution.execution_id[:8])
+        execution.cancel("Ctrl-C")
+        result = await execution.wait()
     if not quiet:
         print_transcript(result, start)
     if result.error:
@@ -239,9 +276,11 @@ async def main() -> int:
         print(f"config error: {exc}", file=sys.stderr)
         return 2
     logger.info(
-        "config loaded: model=%s provider=%s max_steps=%d timeout=%.0fs settings=%s",
+        "config loaded: model=%s provider=%s max_steps=%d timeout=%.0fs settings=%s "
+        "max_retries=%d max_execution_time=%s repeat_call=%s/%d max_context_tokens=%s",
         config["model"], "local" if config["local"] else "litellm", config["max_steps"], config["timeout"],
-        config["settings"],
+        config["settings"], config["max_retries"], config["max_execution_time"] or "none",
+        config["repeat_call_action"], config["repeat_call_threshold"], config["max_context_tokens"] or "none",
     )
     runtime, agent = build(config)
 

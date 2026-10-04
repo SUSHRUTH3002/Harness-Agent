@@ -13,6 +13,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Protocol, Sequence, runtime_checkable
 
+from agent_harness.cancellation import CancellationToken
 from agent_harness.errors import ErrorCode, HarnessError, ValidationError
 from agent_harness.messages import ToolCall, preview, short_id
 from agent_harness.registry import ToolRegistry
@@ -28,6 +29,9 @@ class ToolExecutionContext:
     execution_id: str
     agent_id: str
     step: int
+    cancel: CancellationToken = field(default_factory=CancellationToken)
+    # Default timeout for tools that don't set their own `Tool.timeout` (agent.limits.tool_timeout).
+    default_tool_timeout: float | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -84,8 +88,8 @@ class SequentialToolExecutor:
 
     async def _execute_one(self, call: ToolCall, registry: ToolRegistry, context: ToolExecutionContext) -> ToolResult:
         logger.info(
-            "exec=%s step=%d tool %s started call=%s args=%s",
-            short_id(context.execution_id), context.step, call.name, call.id,
+            "exec=%s step=%d tool %s started args=%s",
+            short_id(context.execution_id), context.step, call.name,
             preview(json.dumps(call.arguments) if call.arguments is not None else str(call.raw_arguments)),
         )
 
@@ -107,12 +111,22 @@ class SequentialToolExecutor:
             call_id=call.id,
             tool_name=call.name,
             step=context.step,
+            cancel=context.cancel,
             metadata=dict(context.metadata),
         )
+        timeout = tool.timeout if tool.timeout is not None else context.default_tool_timeout
         try:
-            value = await tool.execute(arguments, ctx)
+            if timeout is not None:
+                async with asyncio.timeout(timeout):
+                    value = await tool.execute(arguments, ctx)
+            else:
+                value = await tool.execute(arguments, ctx)
         except asyncio.CancelledError:
             raise
+        except TimeoutError:
+            return ToolResult.error(
+                call.id, call.name, f"Tool '{call.name}' timed out after {timeout:.0f}s", ErrorCode.TIMEOUT
+            )
         except HarnessError as exc:
             return ToolResult.error(call.id, call.name, exc.message, exc.code)
         except Exception as exc:
