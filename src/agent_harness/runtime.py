@@ -21,6 +21,7 @@ from agent_harness.cancellation import CancellationToken
 from agent_harness.context import ContextManager, DefaultContextManager
 from agent_harness.errors import ErrorCode, ErrorInfo, HarnessError, ValidationError
 from agent_harness.executor import SequentialToolExecutor, ToolExecutor
+from agent_harness.hooks import Hooks
 from agent_harness.llm import LLMProvider, Usage
 from agent_harness.loop import AgentLoop, LoopDependencies
 from agent_harness.messages import Message, short_id, utcnow
@@ -100,12 +101,17 @@ class Runtime:
         context_manager: ContextManager | None = None,
         tool_executor: ToolExecutor | None = None,
         loop: AgentLoop | None = None,
+        hooks: Hooks | None = None,
     ) -> None:
         if not isinstance(llm, LLMProvider):
             raise TypeError("llm must implement LLMProvider (an async generate(request) method)")
         self.llm = llm
         self.context_manager = context_manager or DefaultContextManager()
-        self.tool_executor = tool_executor or SequentialToolExecutor()
+        # Only auto-wired into the default executor: a caller-supplied tool_executor manages
+        # its own hooks wiring (or doesn't use these hooks at all), same as everywhere else
+        # in this file where bringing your own component means owning its composition.
+        self.hooks = hooks or Hooks()
+        self.tool_executor = tool_executor or SequentialToolExecutor(hooks=self.hooks)
         self.loop = loop or AgentLoop()
 
     def start(self, agent: Agent, input: RunInput | None = None, *, state: AgentState | None = None) -> Execution:
@@ -128,7 +134,7 @@ class Runtime:
         registry = ToolRegistry(agent.tools)
         deps = LoopDependencies(
             llm=self.llm, context=self.context_manager, executor=self.tool_executor, registry=registry,
-            cancel=cancel_token,
+            cancel=cancel_token, hooks=self.hooks,
         )
         exec_id = short_id(state.execution_id)
         logger.info(

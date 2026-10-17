@@ -25,11 +25,14 @@ from agent_harness import (
     Agent,
     AgentLimits,
     AgentState,
+    Hooks,
     ResilientLLMProvider,
     RetryPolicy,
     Role,
     RunResult,
     Runtime,
+    allow,
+    deny,
 )
 from agent_harness.providers.litellm_provider import LiteLLMProvider
 from agent_harness.providers.local_provider import LocalProvider
@@ -55,6 +58,33 @@ INSTRUCTIONS = (
     "You are a helpful assistant. Use the available tools for weather, arithmetic and search "
     "instead of guessing. Answer concisely."
 )
+
+# Banned search terms for the web_search tool. Queries containing these terms will be blocked.
+_BANNED_SEARCH_TERMS = ("bomb", "weapon")
+
+
+def build_hooks() -> Hooks:
+    hooks = Hooks()
+
+    @hooks.on_before_tool
+    def block_banned_search_terms(call, ctx):
+        if call.name != "web_search":
+            return allow()
+        query = str((call.arguments or {}).get("query", "")).lower()
+        hit = next((term for term in _BANNED_SEARCH_TERMS if term in query), None)
+        if hit:
+            return deny(f"web_search queries containing '{hit}' are blocked by policy.")
+        return allow()
+
+    @hooks.on_before_tool
+    def limit_resource_batch_size(call, ctx):
+        if call.name == "fetch_resource_metadata":
+            ids = call.arguments.get("resource_ids", [])
+            if len(ids) > 5:
+                return deny(f"requested {len(ids)} resources at once; limit is 5.")
+        return allow()
+
+    return hooks
 
 
 class ConfigError(Exception):
@@ -196,7 +226,7 @@ def build(config: dict) -> tuple[Runtime, Agent]:
             reserved_output_tokens=config["reserved_output_tokens"],
         ),
     )
-    return Runtime(provider), agent
+    return Runtime(provider, hooks=build_hooks()), agent
 
 
 def print_transcript(result: RunResult, start: int) -> None:

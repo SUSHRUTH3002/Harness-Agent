@@ -140,6 +140,16 @@ Status: Phase 0 proposal. Each phase ends with a **validation gate**: unit tests
 - A failing hook becomes an error result, not a crash.
 - The loop is untouched: `git diff loop.py` should be limited to hook-point calls.
 
+### Phase 4 outcome
+
+- **Implemented** in `hooks.py`: a single `Hooks` registry (not a separate `PipelineToolExecutor` class) with four points -- `before_tool` (`allow`/`deny`/`ask`, deny-only and short-circuiting: the first non-allow decision wins and no later hook can override it back to allow), `after_tool` (each hook may replace the previous one's `ToolResult` in turn), `before_step` (stop the run before the next LLM call), `before_stop` (force one more step with an injected message instead of finishing). Registration is a plain list per hook type, in order, usable directly or as a decorator (`@hooks.on_before_tool`).
+- **`transform_request` and `wrap_llm` were deliberately not built as a second hook list.** Both jobs are already fully served by composition: `ContextManager` for the former, `ResilientLLMProvider` (retry.py) for the latter. Adding a parallel hook mechanism for the same two jobs would mean two different ways to do one thing, which is the opposite of the "generic mechanism, not a second retry system" goal. `wrap_tool` was folded into the existing `Tool.timeout`/`agent.limits.tool_timeout` mechanism for the same reason, rather than becoming a third way to time a tool call.
+- **No tests written** (explicit instruction); verified by hand: `before_tool` deny, `before_tool` ask (resolves to a denial with `TOOL_APPROVAL_REQUIRED`, since no approval handler exists -- same fail-closed default DeepSeek/TrueForge use), `after_tool` content replacement, `before_step` stop (confirmed the LLM is never even called), `before_stop` forced continuation. All five confirmed working with no regression to the Phase 2/3 scenarios (repeated-call guard, cancellation) or the Phase 1 demo, which all still pass unmodified with hooks left empty (the default).
+- **Design note:** `after_tool` sees the *same* `ToolContext` object `before_tool` saw (fixed during implementation -- an earlier draft constructed a second, separate `ToolContext` for `after_tool`, which would have silently lost anything a `before_tool` hook stashed in `ctx.metadata` for a later `after_tool` hook to read).
+- **New error codes:** `TOOL_DENIED`, `TOOL_APPROVAL_REQUIRED`, `STOPPED_BY_HOOK`.
+- **Runtime wiring:** `Runtime(llm, hooks=...)`; the same `Hooks` instance is shared between the loop (`before_step`/`before_stop`) and the *default* tool executor (`before_tool`/`after_tool`) only -- a caller-supplied executor manages its own hooks wiring.
+- **main.py:** one illustrative example hook (`build_hooks()`), a `before_tool` check blocking `web_search` for a couple of banned words -- clearly marked as a replaceable example, not a real content policy.
+
 ## Phase 5: Event System
 
 **Build:** the `Event` model, `EventBus` (async fan-out, isolated failures, ordered), and emits from the runtime, loop, executor and context manager.

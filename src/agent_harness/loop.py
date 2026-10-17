@@ -17,6 +17,7 @@ from agent_harness.cancellation import CancellationToken
 from agent_harness.context import ContextManager
 from agent_harness.errors import ErrorCode, ErrorInfo, LLMError
 from agent_harness.executor import ToolExecutionContext, ToolExecutor
+from agent_harness.hooks import Hooks
 from agent_harness.llm import FinishReason, LLMProvider, LLMRequest, LLMResponse
 from agent_harness.messages import Message, ToolCall, preview, short_id
 from agent_harness.registry import ToolRegistry
@@ -42,6 +43,7 @@ class LoopDependencies:
     executor: ToolExecutor
     registry: ToolRegistry
     cancel: CancellationToken = field(default_factory=CancellationToken)
+    hooks: Hooks = field(default_factory=Hooks)
 
 
 def _tool_call_signature(calls: list[ToolCall]) -> frozenset[str]:
@@ -70,6 +72,18 @@ class AgentLoop:
                 logger.warning("exec=%s stopped: max_steps=%d reached", exec_id, agent.limits.max_steps)
                 state.status = RunStatus.MAX_STEPS
                 return state
+            step_decision = await deps.hooks.run_before_step(agent, state)
+            if step_decision.action == "stop":
+                logger.warning("exec=%s stopped by a before_step hook: %s", exec_id,
+                                step_decision.reason or "no reason given")
+                state.status = RunStatus.FAILED
+                state.error = ErrorInfo(
+                    code=ErrorCode.STOPPED_BY_HOOK,
+                    message=step_decision.reason or "A before_step hook stopped the run.",
+                    type="StoppedByHook",
+                )
+                return state
+
             steps_this_run += 1
             state.step += 1
             logger.info("exec=%s step=%d started (%d/%d this run)", exec_id, state.step, steps_this_run,
@@ -101,6 +115,14 @@ class AgentLoop:
 
             state.append(response.message)
             if not calls:
+                stop_decision = await deps.hooks.run_before_stop(agent, state)
+                if stop_decision.action == "continue":
+                    logger.info("exec=%s step=%d before_stop hook requested another step: %s",
+                                exec_id, state.step, stop_decision.message or "<no message>")
+                    state.append(Message.user(
+                        stop_decision.message or "Continue.", metadata={"source": "harness", "reason": "before_stop_hook"}
+                    ))
+                    continue
                 state.result = state.partial_output + response.message.text
                 state.partial_output = ""
                 state.status = RunStatus.COMPLETED

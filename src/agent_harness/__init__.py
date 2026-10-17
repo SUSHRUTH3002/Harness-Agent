@@ -27,6 +27,7 @@ from agent_harness.errors import (
     ValidationError,
 )
 from agent_harness.executor import SequentialToolExecutor, ToolExecutionContext, ToolExecutor
+from agent_harness.hooks import Hooks, StepDecision, StopDecision, ToolDecision, allow, ask, deny
 from agent_harness.llm import FinishReason, LLMProvider, LLMRequest, LLMResponse, ToolSchema, Usage
 from agent_harness.loop import AgentLoop, LoopDependencies
 from agent_harness.messages import Message, Role, TextPart, ToolCall, ToolCallPart
@@ -54,6 +55,7 @@ __all__ = [
     "FunctionTool",
     "HarnessError",
     "HarnessTimeoutError",
+    "Hooks",
     "LLMError",
     "LLMProvider",
     "LLMRequest",
@@ -68,12 +70,15 @@ __all__ = [
     "RunStatus",
     "Runtime",
     "SequentialToolExecutor",
+    "StepDecision",
+    "StopDecision",
     "TextPart",
     "Tool",
     "ToolAnnotations",
     "ToolCall",
     "ToolCallPart",
     "ToolContext",
+    "ToolDecision",
     "ToolError",
     "ToolExecutionContext",
     "ToolExecutor",
@@ -83,5 +88,8 @@ __all__ = [
     "TokenCounter",
     "Usage",
     "ValidationError",
+    "allow",
+    "ask",
+    "deny",
     "tool",
 ]

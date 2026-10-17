@@ -15,6 +15,7 @@ from typing import Any, Protocol, Sequence, runtime_checkable
 
 from agent_harness.cancellation import CancellationToken
 from agent_harness.errors import ErrorCode, HarnessError, ValidationError
+from agent_harness.hooks import Hooks
 from agent_harness.messages import ToolCall, preview, short_id
 from agent_harness.registry import ToolRegistry
 from agent_harness.tools import ToolContext, ToolResult, normalize_output
@@ -62,6 +63,9 @@ def parse_arguments(call: ToolCall) -> dict[str, Any]:
 class SequentialToolExecutor:
     """Runs calls one at a time, in the order the model issued them."""
 
+    def __init__(self, hooks: Hooks | None = None) -> None:
+        self.hooks = hooks or Hooks()
+
     async def execute(
         self, calls: Sequence[ToolCall], registry: ToolRegistry, context: ToolExecutionContext
     ) -> list[ToolResult]:
@@ -92,28 +96,47 @@ class SequentialToolExecutor:
             short_id(context.execution_id), context.step, call.name,
             preview(json.dumps(call.arguments) if call.arguments is not None else str(call.raw_arguments)),
         )
+        result, ctx = await self._dispatch(call, registry, context)
+        return await self.hooks.run_after_tool(call, result, ctx)
 
+    async def _dispatch(
+        self, call: ToolCall, registry: ToolRegistry, context: ToolExecutionContext
+    ) -> tuple[ToolResult, ToolContext]:
+        """Everything before `after_tool`: lookup, validation, the policy check, and the tool body itself.
+
+        Always returns the `ToolContext` too (even for a lookup/validation
+        failure, using a fallback context), so `after_tool` sees the same
+        object `before_tool` saw -- e.g. anything a `before_tool` hook stashed
+        in `ctx.metadata` for a later `after_tool` hook to read is preserved.
+        """
+        fallback_ctx = ToolContext(
+            execution_id=context.execution_id, agent_id=context.agent_id, call_id=call.id,
+            tool_name=call.name, step=context.step, cancel=context.cancel, metadata=dict(context.metadata),
+        )
         tool = registry.get(call.name)
         if tool is None:
             available = ", ".join(registry.names()[:_MAX_LISTED_TOOLS]) or "none"
             return ToolResult.error(
                 call.id, call.name, f"Unknown tool '{call.name}'. Available tools: {available}", ErrorCode.UNKNOWN_TOOL
-            )
+            ), fallback_ctx
 
         try:
             arguments = tool.validate_arguments(parse_arguments(call))
         except HarnessError as exc:
-            return ToolResult.error(call.id, call.name, exc.message, exc.code)
+            return ToolResult.error(call.id, call.name, exc.message, exc.code), fallback_ctx
 
-        ctx = ToolContext(
-            execution_id=context.execution_id,
-            agent_id=context.agent_id,
-            call_id=call.id,
-            tool_name=call.name,
-            step=context.step,
-            cancel=context.cancel,
-            metadata=dict(context.metadata),
-        )
+        ctx = fallback_ctx
+        decision = await self.hooks.run_before_tool(call, ctx)
+        if decision.action != "allow":
+            if decision.action == "ask":
+                code, label = ErrorCode.TOOL_APPROVAL_REQUIRED, "requires approval, but no approval handler is configured"
+            else:
+                code, label = ErrorCode.TOOL_DENIED, "denied"
+            message = decision.reason or f"Tool '{call.name}' was {label}."
+            logger.warning("exec=%s step=%d tool %s %s: %s", short_id(context.execution_id), context.step,
+                           call.name, label, message)
+            return ToolResult.error(call.id, call.name, message, code), ctx
+
         timeout = tool.timeout if tool.timeout is not None else context.default_tool_timeout
         try:
             if timeout is not None:
@@ -126,22 +149,22 @@ class SequentialToolExecutor:
         except TimeoutError:
             return ToolResult.error(
                 call.id, call.name, f"Tool '{call.name}' timed out after {timeout:.0f}s", ErrorCode.TIMEOUT
-            )
+            ), ctx
         except HarnessError as exc:
-            return ToolResult.error(call.id, call.name, exc.message, exc.code)
+            return ToolResult.error(call.id, call.name, exc.message, exc.code), ctx
         except Exception as exc:
             # Unexpected tool bug: keep the traceback in the logs, give the model a clean message.
             logger.debug("tool %s raised", call.name, exc_info=True)
             return ToolResult.error(
                 call.id, call.name, f"Tool '{call.name}' failed: {type(exc).__name__}: {exc}", ErrorCode.TOOL_ERROR
-            )
+            ), ctx
 
         try:
-            return normalize_output(call.id, call.name, value)
+            return normalize_output(call.id, call.name, value), ctx
         except Exception as exc:
             return ToolResult.error(
                 call.id,
                 call.name,
                 f"Tool '{call.name}' returned a value that could not be serialized: {type(exc).__name__}",
                 ErrorCode.TOOL_ERROR,
-            )
+            ), ctx
