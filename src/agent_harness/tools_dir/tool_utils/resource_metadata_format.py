@@ -594,18 +594,18 @@ def format_resource_metadata_from_config(
     Returns:
         Formatted string with resource metadata
     """
-    if not resource_metadata or str(resource_id) not in resource_metadata:
+    if not resource_metadata or not resource_id:
         return ""
 
-    metadata = resource_metadata[str(resource_id)]
+    metadata = resource_metadata['metadata']
     if not metadata:
         return ""
     
     # Get provider from metadata (always at top level)
-    provider = (metadata.get('provider_key') or '').lower()
+    provider = (resource_metadata.get('providerKey') or '').lower()
     
     # Get resource_sub_type from metadata (always at top level)
-    resource_sub_type = (metadata.get('resource_sub_type') or '').lower()
+    resource_sub_type = (resource_metadata.get('resourceSubType') or '').lower()
 
     # Check if actual data is nested inside __data (API response structure)
     # If so, use __data for field lookups while keeping provider_key and resource_sub_type from top level

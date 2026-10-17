@@ -66,9 +66,9 @@ def fetch_resource_metadata(
     logger.info(f"Successfully fetched resource metadata for resource IDs: {resource_ids}")
 
     # Format resource metadata
-    # for resource_id, resource_metadata in data.items():
-    #     data[resource_id] = format_resource_metadata_from_config(resource_metadata=resource_metadata, resource_id=resource_id, indent=" ")
+    for resource_id, resource_metadata in data.items():
+        data[resource_id] = format_resource_metadata_from_config(resource_metadata=resource_metadata, resource_id=resource_id, indent=" ")
 
-    # logger.info(f"Formatted resource metadata for resource IDs: {resource_ids}")
+    logger.info(f"Formatted resource metadata for resource IDs: {resource_ids}")
     
     return data
