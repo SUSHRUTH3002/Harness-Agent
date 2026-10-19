@@ -26,6 +26,7 @@ from agent_harness.llm import LLMProvider, Usage
 from agent_harness.loop import AgentLoop, LoopDependencies
 from agent_harness.messages import Message, short_id, utcnow
 from agent_harness.registry import ToolRegistry
+from agent_harness.results import LargeResultProcessor
 from agent_harness.state import AgentState, RunStatus
 from agent_harness.tools import ToolResult
 
@@ -102,6 +103,7 @@ class Runtime:
         tool_executor: ToolExecutor | None = None,
         loop: AgentLoop | None = None,
         hooks: Hooks | None = None,
+        result_processor: LargeResultProcessor | None = None,
     ) -> None:
         if not isinstance(llm, LLMProvider):
             raise TypeError("llm must implement LLMProvider (an async generate(request) method)")
@@ -113,6 +115,8 @@ class Runtime:
         self.hooks = hooks or Hooks()
         self.tool_executor = tool_executor or SequentialToolExecutor(hooks=self.hooks)
         self.loop = loop or AgentLoop()
+        # None by default: large-result offloading is opt-in (Phase 7), same as hooks.
+        self.result_processor = result_processor
 
     def start(self, agent: Agent, input: RunInput | None = None, *, state: AgentState | None = None) -> Execution:
         """Start a run without waiting for it, returning a cancellable handle."""
@@ -134,7 +138,7 @@ class Runtime:
         registry = ToolRegistry(agent.tools)
         deps = LoopDependencies(
             llm=self.llm, context=self.context_manager, executor=self.tool_executor, registry=registry,
-            cancel=cancel_token, hooks=self.hooks,
+            cancel=cancel_token, hooks=self.hooks, result_processor=self.result_processor,
         )
         exec_id = short_id(state.execution_id)
         logger.info(

@@ -1,0 +1,7 @@
+# pdb reads this automatically when you run from the project root.
+# pj <expr>  -> pretty-print any harness object (or a list of them) as indented JSON.
+#              Pydantic models are converted with .model_dump(); anything that can't be
+#              JSON-encoded (tool objects, the cancellation token) is shown via str().
+alias pj import json as _j; _d = lambda o: o.model_dump() if hasattr(o, "model_dump") else o; print(_j.dumps([_d(i) for i in %1] if isinstance(%1, (list, tuple)) else _d(%1), indent=2, default=str))
+# pc <expr>  -> a tool result's `content` is itself a JSON string; this decodes and pretty-prints it.
+alias pc import json as _j; print(_j.dumps(_j.loads(%1.content), indent=2))

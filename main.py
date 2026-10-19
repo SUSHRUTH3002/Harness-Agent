@@ -25,7 +25,9 @@ from agent_harness import (
     Agent,
     AgentLimits,
     AgentState,
+    FileArtifactStore,
     Hooks,
+    LargeResultProcessor,
     ResilientLLMProvider,
     RetryPolicy,
     Role,
@@ -33,6 +35,7 @@ from agent_harness import (
     Runtime,
     allow,
     deny,
+    make_read_artifact_tool,
 )
 from agent_harness.providers.litellm_provider import LiteLLMProvider
 from agent_harness.providers.local_provider import LocalProvider
@@ -182,6 +185,13 @@ def load_config() -> dict:
         raise ConfigError(f"HARNESS_REPEAT_CALL_ACTION must be 'warn' or 'stop', got {repeat_action!r}")
 
     return {
+        # Phase 7: large result handling
+        "large_result_handling": _bool("HARNESS_LARGE_RESULT_HANDLING", True),
+        "large_result_per_call_tokens": _number("HARNESS_LARGE_RESULT_PER_CALL_TOKENS", int, 6000),
+        "large_result_per_step_tokens": _number("HARNESS_LARGE_RESULT_PER_STEP_TOKENS", int, 10000),
+        "large_result_preview_chars": _number("HARNESS_LARGE_RESULT_PREVIEW_CHARS", int, 100),
+        "artifact_dir": _env("HARNESS_ARTIFACT_DIR") or str(ROOT / ".artifacts"),
+        "artifact_read_max_chars": _number("HARNESS_ARTIFACT_READ_MAX_CHARS", int, 4000),
         "model": model,
         "local": local,
         "api_base": api_base,
@@ -211,10 +221,20 @@ def build(config: dict) -> tuple[Runtime, Agent]:
     
     # Retries live outside the loop entirely, this wrapper is the only thing that changes when retry behavior changes. (refer retry.py)
     provider = ResilientLLMProvider(provider, policy=RetryPolicy(max_retries=config["max_retries"]))
+
+    tools = [calculator, get_weather, web_search, fetch_resource_metadata]
+    result_processor = None
+    if config["large_result_handling"]:
+        # File-backed so an offloaded result survives past this process and is inspectable on
+        # disk; swap for InMemoryArtifactStore() if you don't want files left behind.
+        store = FileArtifactStore(config["artifact_dir"])
+        result_processor = LargeResultProcessor(store=store)
+        tools.append(make_read_artifact_tool(store, max_chars=config["artifact_read_max_chars"]))
+
     agent = Agent(
         name="assistant",
         instructions=INSTRUCTIONS,
-        tools=[calculator, get_weather, web_search, fetch_resource_metadata],
+        tools=tools,
         model_settings=config["settings"],
         limits=AgentLimits(
             max_steps=config["max_steps"],
@@ -224,9 +244,12 @@ def build(config: dict) -> tuple[Runtime, Agent]:
             repeat_call_action=config["repeat_call_action"],
             max_context_tokens=config["max_context_tokens"],
             reserved_output_tokens=config["reserved_output_tokens"],
+            large_result_per_call_tokens=config["large_result_per_call_tokens"],
+            large_result_per_step_tokens=config["large_result_per_step_tokens"],
+            large_result_preview_chars=config["large_result_preview_chars"],
         ),
     )
-    return Runtime(provider, hooks=build_hooks()), agent
+    return Runtime(provider, hooks=build_hooks(), result_processor=result_processor), agent
 
 
 def print_transcript(result: RunResult, start: int) -> None:
@@ -307,10 +330,12 @@ async def main() -> int:
         return 2
     logger.info(
         "config loaded: model=%s provider=%s max_steps=%d timeout=%.0fs settings=%s "
-        "max_retries=%d max_execution_time=%s repeat_call=%s/%d max_context_tokens=%s",
+        "max_retries=%d max_execution_time=%s repeat_call=%s/%d max_context_tokens=%s "
+        "large_result_handling=%s (per_call=%d per_step=%d)",
         config["model"], "local" if config["local"] else "litellm", config["max_steps"], config["timeout"],
         config["settings"], config["max_retries"], config["max_execution_time"] or "none",
         config["repeat_call_action"], config["repeat_call_threshold"], config["max_context_tokens"] or "none",
+        config["large_result_handling"], config["large_result_per_call_tokens"], config["large_result_per_step_tokens"],
     )
     runtime, agent = build(config)
 

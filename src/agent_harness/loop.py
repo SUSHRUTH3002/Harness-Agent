@@ -21,6 +21,7 @@ from agent_harness.hooks import Hooks
 from agent_harness.llm import FinishReason, LLMProvider, LLMRequest, LLMResponse
 from agent_harness.messages import Message, ToolCall, preview, short_id
 from agent_harness.registry import ToolRegistry
+from agent_harness.results import LargeResultProcessor
 from agent_harness.state import AgentState, RunStatus
 from agent_harness.tools import ToolResult
 
@@ -44,6 +45,7 @@ class LoopDependencies:
     registry: ToolRegistry
     cancel: CancellationToken = field(default_factory=CancellationToken)
     hooks: Hooks = field(default_factory=Hooks)
+    result_processor: LargeResultProcessor | None = None
 
 
 def _tool_call_signature(calls: list[ToolCall]) -> frozenset[str]:
@@ -261,8 +263,10 @@ class AgentLoop:
         )
         results = await deps.executor.execute(calls, deps.registry, context)
 
-        # Enforce the executor contract so the transcript is always valid for providers.
+        # Enforce the executor contract first, so large-result handling (and everything after
+        # it) always sees exactly one real ToolResult per call, in call order.
         by_id = {r.call_id: r for r in results}
+        ordered: list[ToolResult] = []
         for call in calls:
             result = by_id.get(call.id)
             if result is None:
@@ -270,7 +274,16 @@ class AgentLoop:
                 result = ToolResult.error(
                     call.id, call.name, "Tool executor produced no result for this call.", ErrorCode.EXECUTION_ERROR
                 )
+            ordered.append(result)
+
+        if deps.result_processor is not None:
+            exempt = frozenset(t.name for t in deps.registry if t.exempt_from_offload)
+            ordered = await deps.result_processor.process(
+                agent, calls, ordered, execution_id=state.execution_id, step=state.step, exempt_tools=exempt
+            )
+
+        for result in ordered:
             state.append(Message.tool(result.call_id, result.content, name=result.name, is_error=result.is_error))
             state.tool_results.append(result)
-        failed = sum(r.is_error for r in state.tool_results[-len(calls):])
-        logger.info("exec=%s step=%d tools done: %d ok, %d failed", exec_id, state.step, len(calls) - failed, failed)
+        failed = sum(r.is_error for r in ordered)
+        logger.info("exec=%s step=%d tools done: %d ok, %d failed", exec_id, state.step, len(ordered) - failed, failed)

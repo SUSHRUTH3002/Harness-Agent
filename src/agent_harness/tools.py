@@ -73,6 +73,9 @@ class Tool(ABC):
     concurrency_safe: bool = False
     timeout: float | None = None
     annotations: ToolAnnotations = ToolAnnotations()
+    # Never offload this tool's results (results.py). For retrieval tools such as
+    # read_artifact: offloading their output would mean retrieval can never succeed.
+    exempt_from_offload: bool = False
 
     def validate_arguments(self, arguments: dict[str, Any]) -> dict[str, Any]:
         """Return the arguments to pass to `execute`, or raise `ValidationError`."""

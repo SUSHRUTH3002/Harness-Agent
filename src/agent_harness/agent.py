@@ -30,6 +30,14 @@ class AgentLimits(BaseModel):
     # Headroom subtracted from max_context_tokens for the model's own reply.
     reserved_output_tokens: int = Field(default=1024, ge=0)
 
+    # --- Phase 7: large result handling ----------------------------------------
+    # Maximum estimated tokens for a single call's result before offloading.
+    large_result_per_call_tokens: int | None = Field(default=6000, gt=0)
+    # Maximum estimated tokens for a single call's result before offloading.
+    large_result_per_step_tokens: int | None = Field(default=10000, gt=0)
+    # Characters shown from the start and from the end of an offloaded result.
+    large_result_preview_chars: int = Field(default=100, ge=0)
+
 
 class Agent(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)

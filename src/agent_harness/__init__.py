@@ -32,6 +32,7 @@ from agent_harness.llm import FinishReason, LLMProvider, LLMRequest, LLMResponse
 from agent_harness.loop import AgentLoop, LoopDependencies
 from agent_harness.messages import Message, Role, TextPart, ToolCall, ToolCallPart
 from agent_harness.registry import ToolRegistry
+from agent_harness.results import ArtifactStore, FileArtifactStore, InMemoryArtifactStore, LargeResultProcessor, make_read_artifact_tool
 from agent_harness.retry import RetryPolicy, ResilientLLMProvider
 from agent_harness.runtime import Execution, RunResult, Runtime
 from agent_harness.state import AgentState, RunStatus
@@ -42,6 +43,7 @@ __all__ = [
     "AgentLimits",
     "AgentLoop",
     "AgentState",
+    "ArtifactStore",
     "CancellationToken",
     "CharTokenCounter",
     "ContextError",
@@ -51,15 +53,18 @@ __all__ = [
     "ErrorInfo",
     "Execution",
     "ExecutionError",
+    "FileArtifactStore",
     "FinishReason",
     "FunctionTool",
     "HarnessError",
     "HarnessTimeoutError",
     "Hooks",
+    "InMemoryArtifactStore",
     "LLMError",
     "LLMProvider",
     "LLMRequest",
     "LLMResponse",
+    "LargeResultProcessor",
     "LoopDependencies",
     "Message",
     "PromptSection",
@@ -91,5 +96,6 @@ __all__ = [
     "allow",
     "ask",
     "deny",
+    "make_read_artifact_tool",
     "tool",
 ]
