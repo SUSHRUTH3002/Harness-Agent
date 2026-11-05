@@ -12,7 +12,7 @@
 | 7 | Large result handling | **Done** (offload oversized/combined results to an `ArtifactStore` + `read_artifact`; no "summarize" strategy, see outcome notes) | Likely |
 | 8 | Streaming | Not started | Likely |
 | 9 | Persistence | Not started | Likely |
-| 10 | Compaction | Not started | Evaluate after 3 and 7 |
+| 10 | Compaction | **Done** (80% trigger, rolling evidence-preserving summary, each region archived to the `ArtifactStore`, real-usage measurement, compact-and-retry on provider overflow) | Yes (long RCA/debugging sessions) |
 | 11 | Subagents | Not started | Evaluate |
 | 12 | Parallel execution | Not started | Evaluate |
 | 13 | MCP | Not started | Evaluate |

@@ -218,6 +218,21 @@ Status: Phase 0 proposal. Each phase ends with a **validation gate**: unit tests
   - stores a `CompactionCheckpoint` in `state.extensions`, which the `ContextManager` applies as a view.
 - Triggered by the budget, and on `CONTEXT_WINDOW_EXCEEDED` followed by a single retry.
 
+### Phase 10 outcome
+
+- **Use case that shaped it:** long debugging / incident-RCA sessions that gather data from many sources and must not forget older findings. Artifacts (Phase 7) handle *one* oversized result; compaction handles a conversation that has *slowly* grown too big.
+- **Implemented** in `compaction.py` as one concrete `Compactor` class (no protocol, no model-free `PruneToolResultsCompactor`: pruning old tool results is what Phase 7 offloading and Phase 3 dropping already do).
+- **Region:** history is split into first message (always kept) / region (older middle, summarized) / recent tail (kept verbatim, `compaction_keep_recent_ratio=0.3` of the budget). The tail starts on a segment boundary (`context._segment_history`), so a tool call is never separated from its results.
+- **Trigger:** `compaction_trigger_ratio=0.8` of `max_context_tokens - reserved_output_tokens`, checked in `loop.py` before each LLM call. Size is measured from the provider's reported `input_tokens` of the previous request plus a chars/4 estimate of only the messages added since (`usage_anchor`); falls back to a full estimate when the provider reports no usage, after a compaction, or when Phase 3 dropped messages from that request.
+- **Summary:** one extra LLM call, by default to the chat provider and `agent.model` (`Compactor(llm=..., model=...)` to change). The prompt asks for fixed sections (user requests verbatim, timeline, evidence with identifiers copied exactly, sources checked, hypotheses, conclusions, open questions). Each later compaction gets the previous summary and folds it in (rolling). Messages over 24,000 characters are middle-truncated in the summarizer's input only.
+- **Archive (decision: archive each region):** before a region is replaced, its original messages are saved word for word to the `ArtifactStore` as `compacted_region_<n>_<id>`, with a header (message range, tools called, size). The harness, not the model, appends an "Archives" index to the summary message listing every archive, so the model always knows what exists and can search it with `read_artifact`. The same index is kept in `state.extensions["compaction"]["archives"]`, plus a per-compaction `history` log.
+- **History is never edited (D3):** the checkpoint (`summary`, `covered_until`, `count`, `archives`) lives in `state.extensions["compaction"]`; `compacted_view(state)` applies it and `DefaultContextManager.build` uses it, then Phase 3 `_fit_budget` still applies on top as the safety net.
+- **Provider overflow:** a `CONTEXT_WINDOW_EXCEEDED` error from the provider triggers one forced compaction and one retry of that step (works even without `max_context_tokens`). Without a compactor, or if nothing can be compacted, the original error propagates.
+- **Failure handling:** if the summary call fails or comes back empty, nothing changes, Phase 3 dropping keeps the request in budget, and compaction isn't retried for 3 steps. A failed archive write is logged and the summary is still used.
+- **Opt-in:** `Runtime(compactor=...)`, same pattern as `hooks`/`result_processor`.
+- **main.py:** `HARNESS_COMPACTION` (default on), `HARNESS_COMPACTION_TRIGGER`, `HARNESS_COMPACTION_KEEP_RECENT`, `HARNESS_COMPACTION_MODEL`, `HARNESS_COMPACTION_SUMMARY_MAX_TOKENS`. One `FileArtifactStore` and one `read_artifact` tool are shared by offloading and archives.
+- **No tests written** (explicit instruction); verified with a scripted fake provider: repeated compactions produce contiguous, non-overlapping archives starting at message 1 and a rolling summary that sees the previous one; every request stayed in budget with tool pairs intact; a failing summarizer falls back to dropping with a cooldown; provider overflow compacts and retries (and still fails without a compactor); measured usage triggers compaction; the checkpoint survives multi-turn chat.
+
 ## Phase 11: Subagents
 
 **Build:** a `SubagentTool(agent, runtime)`:

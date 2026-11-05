@@ -18,6 +18,7 @@ from pydantic import BaseModel
 
 from agent_harness.agent import Agent
 from agent_harness.cancellation import CancellationToken
+from agent_harness.compaction import Compactor
 from agent_harness.context import ContextManager, DefaultContextManager
 from agent_harness.errors import ErrorCode, ErrorInfo, HarnessError, ValidationError
 from agent_harness.executor import SequentialToolExecutor, ToolExecutor
@@ -104,6 +105,7 @@ class Runtime:
         loop: AgentLoop | None = None,
         hooks: Hooks | None = None,
         result_processor: LargeResultProcessor | None = None,
+        compactor: Compactor | None = None,
     ) -> None:
         if not isinstance(llm, LLMProvider):
             raise TypeError("llm must implement LLMProvider (an async generate(request) method)")
@@ -117,6 +119,8 @@ class Runtime:
         self.loop = loop or AgentLoop()
         # None by default: large-result offloading is opt-in (Phase 7), same as hooks.
         self.result_processor = result_processor
+        # None by default: compaction is opt-in (Phase 10) and also needs agent.limits.max_context_tokens.
+        self.compactor = compactor
 
     def start(self, agent: Agent, input: RunInput | None = None, *, state: AgentState | None = None) -> Execution:
         """Start a run without waiting for it, returning a cancellable handle."""
@@ -139,6 +143,7 @@ class Runtime:
         deps = LoopDependencies(
             llm=self.llm, context=self.context_manager, executor=self.tool_executor, registry=registry,
             cancel=cancel_token, hooks=self.hooks, result_processor=self.result_processor,
+            compactor=self.compactor,
         )
         exec_id = short_id(state.execution_id)
         logger.info(

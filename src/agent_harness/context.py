@@ -5,6 +5,10 @@ Phase 3 adds ordered prompt sections and a token budget: when
 groups are dropped from the *view* sent to the model -- `state.messages`
 itself is never edited (design.md D3). The system prompt and the first
 message are never dropped.
+
+Phase 10: if the state was compacted (compaction.py), the history starts
+from the compacted view -- first message, summary, then the uncompacted
+messages -- and the budget is applied to that.
 """
 
 from __future__ import annotations
@@ -191,7 +195,11 @@ class DefaultContextManager:
     async def build(self, agent: Agent, state: AgentState, tools: Sequence[ToolSchema]) -> LLMRequest:
         system_text = self._render_system_prompt(agent, state)
         system = Message.system(system_text, metadata={"source": "instructions"}) if system_text else None
-        history = list(state.messages)
+        # Imported here: compaction.py builds on this module's token helpers.
+        from agent_harness.compaction import compacted_view
+
+        # first message + compaction summary + uncompacted messages (just state.messages if never compacted).
+        history = compacted_view(state)
         groups_dropped = 0
 
         budget = agent.limits.max_context_tokens

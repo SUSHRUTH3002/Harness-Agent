@@ -8,6 +8,7 @@ _logging.getLogger(__name__).addHandler(_logging.NullHandler())
 
 from agent_harness.agent import Agent, AgentLimits
 from agent_harness.cancellation import CancellationToken
+from agent_harness.compaction import Compactor, compacted_view
 from agent_harness.context import (
     CharTokenCounter,
     ContextManager,
@@ -46,6 +47,7 @@ __all__ = [
     "ArtifactStore",
     "CancellationToken",
     "CharTokenCounter",
+    "Compactor",
     "ContextError",
     "ContextManager",
     "DefaultContextManager",
@@ -95,6 +97,7 @@ __all__ = [
     "ValidationError",
     "allow",
     "ask",
+    "compacted_view",
     "deny",
     "make_read_artifact_tool",
     "tool",

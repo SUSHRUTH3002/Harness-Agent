@@ -199,7 +199,8 @@ def make_read_artifact_tool(store: ArtifactStore, *, max_chars: int = 4000) -> T
         exempt_from_offload = True
         description = (
             "Read a large tool result that was previously offloaded (see a tool result starting "
-            "with 'Result too large...'). Use `search` to jump to a specific part, or `start`/"
+            "with 'Result too large...'), or an archive of earlier conversation listed under "
+            "'Archives' in a compaction summary. Use `search` to jump to a specific part, or `start`/"
             f"`length` to page through it. At most {max_chars} characters are returned per call; "
             "when `has_more` is true, call again with `start` set to the returned `next_start`."
         )

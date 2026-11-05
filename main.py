@@ -25,6 +25,7 @@ from agent_harness import (
     Agent,
     AgentLimits,
     AgentState,
+    Compactor,
     FileArtifactStore,
     Hooks,
     LargeResultProcessor,
@@ -192,6 +193,12 @@ def load_config() -> dict:
         "large_result_preview_chars": _number("HARNESS_LARGE_RESULT_PREVIEW_CHARS", int, 100),
         "artifact_dir": _env("HARNESS_ARTIFACT_DIR") or str(ROOT / ".artifacts"),
         "artifact_read_max_chars": _number("HARNESS_ARTIFACT_READ_MAX_CHARS", int, 4000),
+        # Phase 10: compaction
+        "compaction": _bool("HARNESS_COMPACTION", True),
+        "compaction_trigger_ratio": _number("HARNESS_COMPACTION_TRIGGER", float, 0.8),
+        "compaction_keep_recent_ratio": _number("HARNESS_COMPACTION_KEEP_RECENT", float, 0.3),
+        "compaction_model": _env("HARNESS_COMPACTION_MODEL"),
+        "compaction_summary_max_tokens": _number("HARNESS_COMPACTION_SUMMARY_MAX_TOKENS", int, 4096),
         "model": model,
         "local": local,
         "api_base": api_base,
@@ -224,12 +231,20 @@ def build(config: dict) -> tuple[Runtime, Agent]:
 
     tools = [calculator, get_weather, web_search, fetch_resource_metadata]
     result_processor = None
-    if config["large_result_handling"]:
-        # File-backed so an offloaded result survives past this process and is inspectable on
-        # disk; swap for InMemoryArtifactStore() if you don't want files left behind.
+    compactor = None
+    if config["large_result_handling"] or config["compaction"]:
+        # One store for both offloaded results (Phase 7) and compaction archives (Phase 10), so a
+        # single read_artifact tool reads either. File-backed so they survive past this process and
+        # are inspectable on disk; swap for InMemoryArtifactStore() if you don't want files left behind.
         store = FileArtifactStore(config["artifact_dir"])
-        result_processor = LargeResultProcessor(store=store)
         tools.append(make_read_artifact_tool(store, max_chars=config["artifact_read_max_chars"]))
+        if config["large_result_handling"]:
+            result_processor = LargeResultProcessor(store=store)
+        if config["compaction"]:
+            # Summaries use the chat provider and model unless HARNESS_COMPACTION_MODEL is set
+            # (any LiteLLM model string; in local mode, another model on the same server).
+            compactor = Compactor(store=store, model=config["compaction_model"],
+                                  summary_max_tokens=config["compaction_summary_max_tokens"])
 
     agent = Agent(
         name="assistant",
@@ -247,9 +262,12 @@ def build(config: dict) -> tuple[Runtime, Agent]:
             large_result_per_call_tokens=config["large_result_per_call_tokens"],
             large_result_per_step_tokens=config["large_result_per_step_tokens"],
             large_result_preview_chars=config["large_result_preview_chars"],
+            compaction_trigger_ratio=config["compaction_trigger_ratio"],
+            compaction_keep_recent_ratio=config["compaction_keep_recent_ratio"],
         ),
     )
-    return Runtime(provider, hooks=build_hooks(), result_processor=result_processor), agent
+    runtime = Runtime(provider, hooks=build_hooks(), result_processor=result_processor, compactor=compactor)
+    return runtime, agent
 
 
 def print_transcript(result: RunResult, start: int) -> None:
@@ -331,12 +349,17 @@ async def main() -> int:
     logger.info(
         "config loaded: model=%s provider=%s max_steps=%d timeout=%.0fs settings=%s "
         "max_retries=%d max_execution_time=%s repeat_call=%s/%d max_context_tokens=%s "
-        "large_result_handling=%s (per_call=%d per_step=%d)",
+        "large_result_handling=%s (per_call=%d per_step=%d) compaction=%s (trigger=%.0f%% keep_recent=%.0f%% model=%s)",
         config["model"], "local" if config["local"] else "litellm", config["max_steps"], config["timeout"],
         config["settings"], config["max_retries"], config["max_execution_time"] or "none",
         config["repeat_call_action"], config["repeat_call_threshold"], config["max_context_tokens"] or "none",
         config["large_result_handling"], config["large_result_per_call_tokens"], config["large_result_per_step_tokens"],
+        config["compaction"], config["compaction_trigger_ratio"] * 100, config["compaction_keep_recent_ratio"] * 100,
+        config["compaction_model"] or "chat model",
     )
+    if config["compaction"] and not config["max_context_tokens"]:
+        logger.warning("HARNESS_COMPACTION is on but HARNESS_MAX_CONTEXT_TOKENS is blank: compaction will only "
+                       "run if the provider rejects a request as too long")
     runtime, agent = build(config)
 
     if args.question:

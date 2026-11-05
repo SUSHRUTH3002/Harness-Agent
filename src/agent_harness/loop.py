@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 
 from agent_harness.agent import Agent
 from agent_harness.cancellation import CancellationToken
+from agent_harness.compaction import Compactor
 from agent_harness.context import ContextManager
 from agent_harness.errors import ErrorCode, ErrorInfo, LLMError
 from agent_harness.executor import ToolExecutionContext, ToolExecutor
@@ -46,6 +47,7 @@ class LoopDependencies:
     cancel: CancellationToken = field(default_factory=CancellationToken)
     hooks: Hooks = field(default_factory=Hooks)
     result_processor: LargeResultProcessor | None = None
+    compactor: Compactor | None = None
 
 
 def _tool_call_signature(calls: list[ToolCall]) -> frozenset[str]:
@@ -92,11 +94,16 @@ class AgentLoop:
                         agent.limits.max_steps)
 
             request = await deps.context.build(agent, state, deps.registry.schemas())
+            if deps.compactor is not None and await deps.compactor.maybe_compact(agent, state, request, deps.llm):
+                request = await deps.context.build(agent, state, deps.registry.schemas())
             logger.debug("exec=%s step=%d calling LLM: %d messages, %d tools", exec_id, state.step,
                          len(request.messages), len(request.tools))
             started = time.perf_counter()
 
-            response = await self._generate(agent, deps, request)
+            history_length = len(state.messages)
+            request, response = await self._generate_with_overflow_retry(agent, state, deps, request)
+            if deps.compactor is not None:
+                deps.compactor.record_usage(state, request, history_length, response.usage)
 
             state.usage = state.usage + response.usage
             calls = response.message.tool_calls
@@ -136,6 +143,34 @@ class AgentLoop:
             await self._execute_tools(calls, state, deps, agent)
             if self._check_repeated_calls(agent, state, calls):
                 return state
+
+    async def _generate_with_overflow_retry(
+        self, agent: Agent, state: AgentState, deps: LoopDependencies, request: LLMRequest
+    ) -> tuple[LLMRequest, LLMResponse]:
+        """`_generate`, plus: if the provider rejects the request as too long for the model's
+        context window, compact once and retry with the smaller request.
+
+        Token counts are estimates, so a request under our budget can still be over the
+        model's real limit; this is the backstop. Without a compactor, or if compaction
+        can't shrink anything, the original error propagates.
+        """
+        try:
+            return request, await self._generate(agent, deps, request)
+        except LLMError as exc:
+            if exc.code != ErrorCode.CONTEXT_WINDOW_EXCEEDED or deps.compactor is None:
+                raise
+            exec_id = short_id(state.execution_id)
+            estimated = request.metadata.get("context", {}).get("estimated_tokens", 0)
+            logger.warning("exec=%s step=%d provider rejected the request as too long (~%d tokens est.); "
+                           "compacting and retrying once", exec_id, state.step, estimated)
+            compacted = await deps.compactor.compact(
+                agent, state, deps.llm, target_tokens=int(estimated * 0.7) or 1, current_tokens=estimated,
+                reason="provider_overflow",
+            )
+            if not compacted:
+                raise
+            request = await deps.context.build(agent, state, deps.registry.schemas())
+            return request, await self._generate(agent, deps, request)
 
     async def _generate(self, agent: Agent, deps: LoopDependencies, request: LLMRequest) -> LLMResponse:
         """Call the LLM, honoring `agent.limits.llm_timeout` if set.

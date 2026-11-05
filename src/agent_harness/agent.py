@@ -33,10 +33,16 @@ class AgentLimits(BaseModel):
     # --- Phase 7: large result handling ----------------------------------------
     # Maximum estimated tokens for a single call's result before offloading.
     large_result_per_call_tokens: int | None = Field(default=6000, gt=0)
-    # Maximum estimated tokens for a single call's result before offloading.
+    # Combined total estimated tokens for all results in a single step before offloading.
     large_result_per_step_tokens: int | None = Field(default=10000, gt=0)
     # Characters shown from the start and from the end of an offloaded result.
     large_result_preview_chars: int = Field(default=100, ge=0)
+
+    # --- Phase 10: compaction (only with a Compactor attached and max_context_tokens set) ---
+    # Compact when the next request reaches this share of (max_context_tokens - reserved_output_tokens).
+    compaction_trigger_ratio: float = Field(default=0.8, gt=0, le=1)
+    # Share of that budget kept word for word as the recent tail; older messages get summarized.
+    compaction_keep_recent_ratio: float = Field(default=0.3, gt=0, lt=1)
 
 
 class Agent(BaseModel):
