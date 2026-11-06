@@ -21,11 +21,12 @@ from agent_harness.cancellation import CancellationToken
 from agent_harness.compaction import Compactor
 from agent_harness.context import ContextManager, DefaultContextManager
 from agent_harness.errors import ErrorCode, ErrorInfo, HarnessError, ValidationError
+from agent_harness.events import EventEmitter, EventSink
 from agent_harness.executor import SequentialToolExecutor, ToolExecutor
 from agent_harness.hooks import Hooks
 from agent_harness.llm import LLMProvider, Usage
 from agent_harness.loop import AgentLoop, LoopDependencies
-from agent_harness.messages import Message, short_id, utcnow
+from agent_harness.messages import Message, Role, short_id, utcnow
 from agent_harness.registry import ToolRegistry
 from agent_harness.results import LargeResultProcessor
 from agent_harness.state import AgentState, RunStatus
@@ -122,28 +123,53 @@ class Runtime:
         # None by default: compaction is opt-in (Phase 10) and also needs agent.limits.max_context_tokens.
         self.compactor = compactor
 
-    def start(self, agent: Agent, input: RunInput | None = None, *, state: AgentState | None = None) -> Execution:
-        """Start a run without waiting for it, returning a cancellable handle."""
+    def start(
+        self,
+        agent: Agent,
+        input: RunInput | None = None,
+        *,
+        state: AgentState | None = None,
+        on_event: EventSink | None = None,
+    ) -> Execution:
+        """Start a run without waiting for it, returning a cancellable handle.
+
+        `on_event` receives an `Event` for each thing that happens in this run (events.py).
+        """
         resumed = state is not None
         state = self._prepare_state(agent, input, state)
         cancel_token = CancellationToken()
-        task = asyncio.ensure_future(self._execute(agent, state, cancel_token, resumed=resumed))
+        events = EventEmitter(on_event, execution_id=state.execution_id, agent_id=agent.id)
+        task = asyncio.ensure_future(self._execute(agent, state, cancel_token, resumed=resumed, events=events))
         return Execution(task, cancel_token, state.execution_id)
 
-    async def run(self, agent: Agent, input: RunInput | None = None, *, state: AgentState | None = None) -> RunResult:
-        return await self.start(agent, input, state=state).wait()
+    async def run(
+        self,
+        agent: Agent,
+        input: RunInput | None = None,
+        *,
+        state: AgentState | None = None,
+        on_event: EventSink | None = None,
+    ) -> RunResult:
+        return await self.start(agent, input, state=state, on_event=on_event).wait()
 
     def run_sync(self, agent: Agent, input: RunInput | None = None, *, state: AgentState | None = None) -> RunResult:
         return asyncio.run(self.run(agent, input, state=state))
 
     async def _execute(
-        self, agent: Agent, state: AgentState, cancel_token: CancellationToken, *, resumed: bool
+        self,
+        agent: Agent,
+        state: AgentState,
+        cancel_token: CancellationToken,
+        *,
+        resumed: bool,
+        events: EventEmitter | None = None,
     ) -> RunResult:
+        events = events or EventEmitter()
         registry = ToolRegistry(agent.tools)
         deps = LoopDependencies(
             llm=self.llm, context=self.context_manager, executor=self.tool_executor, registry=registry,
             cancel=cancel_token, hooks=self.hooks, result_processor=self.result_processor,
-            compactor=self.compactor,
+            compactor=self.compactor, events=events,
         )
         exec_id = short_id(state.execution_id)
         logger.info(
@@ -154,6 +180,9 @@ class Runtime:
         steps_before = state.step
         started = time.monotonic()
         state.started_at = state.started_at or utcnow()
+        last_user = next((m for m in reversed(state.messages) if m.role is Role.USER), None)
+        await events.emit("run.started", state.step, input=last_user.text if last_user else None,
+                          history=len(state.messages), resumed=resumed)
         try:
             await registry.setup()
             logger.debug("exec=%s tools ready: %s", exec_id, ", ".join(registry.names()) or "none")
@@ -201,6 +230,11 @@ class Runtime:
             exec_id, state.status.value, state.step - steps_before, duration,
             state.usage.input_tokens, state.usage.output_tokens,
             f" error={state.error.code}" if state.error else "",
+        )
+        await events.emit(
+            "run.finished", state.step, status=state.status.value, output=state.result,
+            error=state.error.model_dump(mode="json") if state.error else None, usage=state.usage.model_dump(),
+            steps=state.step - steps_before, duration=round(duration, 3),
         )
         return RunResult(
             execution_id=state.execution_id,

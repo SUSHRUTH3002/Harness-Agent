@@ -177,7 +177,9 @@ class LargeResultProcessor:
             f"(artifact_id=\"{artifact_id}\") to read specific parts of it if you need to."
         )
         return result.model_copy(
-            update={"content": content, "metadata": {**result.metadata, "artifact_id": artifact_id, "offloaded": True}}
+            update={"content": content, "metadata": {
+                **result.metadata, "artifact_id": artifact_id, "offloaded": True, "tokens": tokens,
+            }}
         )
 
 

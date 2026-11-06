@@ -7,7 +7,7 @@
 | 2 | Reliability & execution control | **Done** (retry/timeout middleware, cancellation, transcript repair, repeated-call guard) | Yes |
 | 3 | Context management | **Done** (token budget, ordered prompt sections, oldest-group reduction, overflow) | Yes |
 | 4 | Tool execution pipeline (hooks) | **Done** (`before_step`, `before_tool`, `after_tool`, `before_stop` -- `wrap_llm`/`transform_request`/`wrap_tool` served by existing composition, not a second hook list) | Yes |
-| 5 | Event system | Not started | Yes |
+| 5 | Event system | **Partly done**: `Runtime.start(on_event=...)` emits run/step/LLM/tool/offload/compaction events (`events.py`), used by the web UI. Not yet: observer registry, transient token events. | Yes |
 | 6 | Observability | Not started | Yes |
 | 7 | Large result handling | **Done** (offload oversized/combined results to an `ArtifactStore` + `read_artifact`; no "summarize" strategy, see outcome notes) | Likely |
 | 8 | Streaming | Not started | Likely |
@@ -19,6 +19,7 @@
 | 14 | Safety & governance | Not started | Evaluate |
 | 15 | Replay | Not started | Evaluate after 9 |
 | 16 | Plugin architecture | Not started | Formalize what exists |
+| — | Web UI + sessions in Postgres (not in the original plan) | **Done**: `server/` (FastAPI, asyncpg), `ui/` (React + Vite), `docker-compose.yml`; see [web-ui.md](web-ui.md) | Requested |
 
 ## Phase 0 review decisions
 

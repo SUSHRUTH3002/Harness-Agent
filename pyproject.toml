@@ -14,6 +14,8 @@ dependencies = ["pydantic>=2.6"]
 litellm = ["litellm>=1.40", "python-dotenv>=1.0"]
 # For a local OpenAI-compatible server (Ollama, vLLM, llama.cpp, LM Studio, ...) via LocalProvider.
 local = ["instructor>=1.0", "openai>=1.0", "python-dotenv>=1.0"]
+# Web UI backend (server/): FastAPI + Postgres for users, incidents, sessions and chats.
+server = ["fastapi>=0.110", "uvicorn[standard]>=0.29", "asyncpg>=0.29", "python-dotenv>=1.0"]
 dev = ["pytest>=8", "pytest-asyncio>=0.23"]
 
 [tool.hatch.build.targets.wheel]

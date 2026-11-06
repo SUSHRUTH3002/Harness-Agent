@@ -17,6 +17,7 @@ from agent_harness.cancellation import CancellationToken
 from agent_harness.compaction import Compactor
 from agent_harness.context import ContextManager
 from agent_harness.errors import ErrorCode, ErrorInfo, LLMError
+from agent_harness.events import EventEmitter
 from agent_harness.executor import ToolExecutionContext, ToolExecutor
 from agent_harness.hooks import Hooks
 from agent_harness.llm import FinishReason, LLMProvider, LLMRequest, LLMResponse
@@ -48,6 +49,7 @@ class LoopDependencies:
     hooks: Hooks = field(default_factory=Hooks)
     result_processor: LargeResultProcessor | None = None
     compactor: Compactor | None = None
+    events: EventEmitter = field(default_factory=EventEmitter)
 
 
 def _tool_call_signature(calls: list[ToolCall]) -> frozenset[str]:
@@ -92,10 +94,15 @@ class AgentLoop:
             state.step += 1
             logger.info("exec=%s step=%d started (%d/%d this run)", exec_id, state.step, steps_this_run,
                         agent.limits.max_steps)
+            await deps.events.emit("step.started", state.step)
 
             request = await deps.context.build(agent, state, deps.registry.schemas())
             if deps.compactor is not None and await deps.compactor.maybe_compact(agent, state, request, deps.llm):
+                await self._emit_compacted(state, deps)
                 request = await deps.context.build(agent, state, deps.registry.schemas())
+            context_info = request.metadata.get("context", {})
+            if context_info.get("groups_dropped"):
+                await deps.events.emit("context.reduced", state.step, **context_info)
             logger.debug("exec=%s step=%d calling LLM: %d messages, %d tools", exec_id, state.step,
                          len(request.messages), len(request.tools))
             started = time.perf_counter()
@@ -107,6 +114,13 @@ class AgentLoop:
 
             state.usage = state.usage + response.usage
             calls = response.message.tool_calls
+            await deps.events.emit(
+                "llm.response", state.step, text=response.message.text,
+                tool_calls=[{"id": c.id, "name": c.name, "arguments": c.arguments if c.arguments is not None
+                             else c.raw_arguments} for c in calls],
+                finish_reason=response.finish_reason.value, usage=response.usage.model_dump(),
+                duration=round(time.perf_counter() - started, 3),
+            )
 
             logger.info(
                 "exec=%s step=%d LLM responded in %.2fs: finish=%s tool_calls=%d tokens in=%d out=%d",
@@ -169,8 +183,15 @@ class AgentLoop:
             )
             if not compacted:
                 raise
+            await self._emit_compacted(state, deps)
             request = await deps.context.build(agent, state, deps.registry.schemas())
             return request, await self._generate(agent, deps, request)
+
+    @staticmethod
+    async def _emit_compacted(state: AgentState, deps: LoopDependencies) -> None:
+        if deps.events.enabled:
+            record = state.extensions["compaction"]["history"][-1]
+            await deps.events.emit("context.compacted", state.step, **record)
 
     async def _generate(self, agent: Agent, deps: LoopDependencies, request: LLMRequest) -> LLMResponse:
         """Call the LLM, honoring `agent.limits.llm_timeout` if set.
@@ -295,6 +316,7 @@ class AgentLoop:
             step=state.step,
             cancel=deps.cancel,
             default_tool_timeout=agent.limits.tool_timeout,
+            events=deps.events if deps.events.enabled else None,
         )
         results = await deps.executor.execute(calls, deps.registry, context)
 
@@ -317,6 +339,11 @@ class AgentLoop:
                 agent, calls, ordered, execution_id=state.execution_id, step=state.step, exempt_tools=exempt
             )
 
+        for call, result in zip(calls, ordered):
+            if result.metadata.get("offloaded"):
+                await deps.events.emit("tool.offloaded", state.step, call_id=call.id, name=result.name,
+                                       artifact_id=result.metadata["artifact_id"],
+                                       tokens=result.metadata.get("tokens"))
         for result in ordered:
             state.append(Message.tool(result.call_id, result.content, name=result.name, is_error=result.is_error))
             state.tool_results.append(result)

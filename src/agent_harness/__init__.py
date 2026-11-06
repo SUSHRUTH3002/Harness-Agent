@@ -27,6 +27,7 @@ from agent_harness.errors import (
     ToolError,
     ValidationError,
 )
+from agent_harness.events import Event, EventEmitter, EventSink
 from agent_harness.executor import SequentialToolExecutor, ToolExecutionContext, ToolExecutor
 from agent_harness.hooks import Hooks, StepDecision, StopDecision, ToolDecision, allow, ask, deny
 from agent_harness.llm import FinishReason, LLMProvider, LLMRequest, LLMResponse, ToolSchema, Usage
@@ -53,6 +54,9 @@ __all__ = [
     "DefaultContextManager",
     "ErrorCode",
     "ErrorInfo",
+    "Event",
+    "EventEmitter",
+    "EventSink",
     "Execution",
     "ExecutionError",
     "FileArtifactStore",

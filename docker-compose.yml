@@ -1,0 +1,27 @@
+# Local Postgres for the web UI (users, incidents, sessions, chats).
+#   docker compose up -d       start (data persists in the harness_pgdata volume)
+#   docker compose down        stop (keeps data)
+#   docker compose down -v     stop and DELETE all data
+# Port 5433 on your machine, so it never clashes with another Postgres on 5432.
+# The server creates/updates its tables itself on startup (server/schema.sql).
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: harness-postgres
+    environment:
+      POSTGRES_USER: harness
+      POSTGRES_PASSWORD: harness
+      POSTGRES_DB: harness
+    ports:
+      - "5433:5432"
+    volumes:
+      - harness_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U harness -d harness"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  harness_pgdata:

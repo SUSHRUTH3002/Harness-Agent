@@ -15,6 +15,7 @@ from typing import Any, Protocol, Sequence, runtime_checkable
 
 from agent_harness.cancellation import CancellationToken
 from agent_harness.errors import ErrorCode, HarnessError, ValidationError
+from agent_harness.events import EventEmitter, clip
 from agent_harness.hooks import Hooks
 from agent_harness.messages import ToolCall, preview, short_id
 from agent_harness.registry import ToolRegistry
@@ -34,6 +35,8 @@ class ToolExecutionContext:
     # Default timeout for tools that don't set their own `Tool.timeout` (agent.limits.tool_timeout).
     default_tool_timeout: float | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Receives tool.started / tool.completed events (events.py). None = no events.
+    events: EventEmitter | None = None
 
 
 @runtime_checkable
@@ -73,9 +76,19 @@ class SequentialToolExecutor:
 
     async def execute_one(self, call: ToolCall, registry: ToolRegistry, context: ToolExecutionContext) -> ToolResult:
         exec_id = short_id(context.execution_id)
+        events = context.events
+        if events is not None:
+            await events.emit("tool.started", context.step, call_id=call.id, name=call.name,
+                              arguments=call.arguments if call.arguments is not None else call.raw_arguments)
         started = time.perf_counter()
         result = await self._execute_one(call, registry, context)
         elapsed = time.perf_counter() - started
+        if events is not None:
+            await events.emit(
+                "tool.completed", context.step, call_id=call.id, name=call.name, is_error=result.is_error,
+                error_code=result.error_code, content=clip(result.content), chars=len(result.content),
+                duration=round(elapsed, 3),
+            )
         if result.is_error:
             logger.warning(
                 "exec=%s step=%d tool %s failed in %.3fs [%s]: %s",
