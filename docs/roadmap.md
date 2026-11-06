@@ -14,7 +14,8 @@
 | 9 | Persistence | Not started | Likely |
 | 10 | Compaction | **Done** (80% trigger, rolling evidence-preserving summary, each region archived to the `ArtifactStore`, real-usage measurement, compact-and-retry on provider overflow) | Yes (long RCA/debugging sessions) |
 | 11 | Subagents | Not started | Evaluate |
-| 12 | Parallel execution | Not started | Evaluate |
+| 12 | Parallel execution | **Done** (`ParallelToolExecutor`: concurrency-safe calls run together in a sliding pool, unsafe calls are barriers, policy and results in model order, per-call failure isolation, optional cross-run cap) | Yes (RCA pulls from many sources at once) |
+| 12b | Human-in-the-loop (HITL) | **Planned** (added 2026-11-06; plan after Phase 12) | Yes: approve / edit / reject tool calls, forms with options, free-text answers, notes |
 | 13 | MCP | Not started | Evaluate |
 | 14 | Safety & governance | Not started | Evaluate |
 | 15 | Replay | Not started | Evaluate after 9 |
@@ -27,5 +28,5 @@
 | 1 | Package name | **`agent_harness`** (distribution name `agent-harness`) |
 | 2 | Source of truth / storage | **In-memory `AgentState` is the source of truth during a run.** No database in the core. Phase 9 adds a `PersistenceStore` interface (in-memory + optional SQLite/Postgres extra) modeled on TrueForge: an immutable message log plus per-run message-id arrays, save-before-mutate at step boundaries, and a shared store contract test suite. The context-engineering techniques (offload, compaction) come from TrueForge in Phases 3, 7 and 10. |
 | 3 | `finish_reason=length` handling | **Continue up to 3 times** (`AgentLimits.max_truncation_continuations`). Then fail with `OUTPUT_TRUNCATED`, keeping the partial text. Implemented in Phase 1. |
-| 4 | Human-in-the-loop | **Not required now.** Approval and suspend/resume are deferred. Phase 14 keeps only allow/deny policy. |
+| 4 | Human-in-the-loop | **Not required now.** Approval and suspend/resume are deferred. Phase 14 keeps only allow/deny policy. *Superseded 2026-11-06: HITL is now planned as Phase 12b.* |
 | 5 | Default `max_steps` | **15** |

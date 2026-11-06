@@ -295,6 +295,7 @@ class AgentLoop:
             step=state.step,
             cancel=deps.cancel,
             default_tool_timeout=agent.limits.tool_timeout,
+            max_parallel_tool_calls=agent.limits.max_parallel_tool_calls,
         )
         results = await deps.executor.execute(calls, deps.registry, context)
 

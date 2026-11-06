@@ -197,6 +197,8 @@ def make_read_artifact_tool(store: ArtifactStore, *, max_chars: int = 4000) -> T
     class ReadArtifact(Tool):
         name = "read_artifact"
         exempt_from_offload = True
+        # Only reads: several artifacts can be read at the same time (ParallelToolExecutor).
+        concurrency_safe = True
         description = (
             "Read a large tool result that was previously offloaded (see a tool result starting "
             "with 'Result too large...'), or an archive of earlier conversation listed under "

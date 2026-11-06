@@ -29,6 +29,7 @@ from agent_harness import (
     FileArtifactStore,
     Hooks,
     LargeResultProcessor,
+    ParallelToolExecutor,
     ResilientLLMProvider,
     RetryPolicy,
     Role,
@@ -60,7 +61,8 @@ litellm.suppress_debug_info = False
 
 INSTRUCTIONS = (
     "You are a helpful assistant. Use the available tools for weather, arithmetic and search "
-    "instead of guessing. Answer concisely."
+    "instead of guessing. When you need several independent pieces of information, request all "
+    "of those tool calls in the same response so they can run in parallel. Answer concisely."
 )
 
 # Banned search terms for the web_search tool. Queries containing these terms will be blocked.
@@ -199,6 +201,10 @@ def load_config() -> dict:
         "compaction_keep_recent_ratio": _number("HARNESS_COMPACTION_KEEP_RECENT", float, 0.3),
         "compaction_model": _env("HARNESS_COMPACTION_MODEL"),
         "compaction_summary_max_tokens": _number("HARNESS_COMPACTION_SUMMARY_MAX_TOKENS", int, 4096),
+        # Phase 12: parallel tool execution
+        "parallel_tools": _bool("HARNESS_PARALLEL_TOOLS", True),
+        "max_parallel_tools": _number("HARNESS_MAX_PARALLEL_TOOLS", int, 10),
+        "max_parallel_tools_total": _number("HARNESS_MAX_PARALLEL_TOOLS_TOTAL", int),
         "model": model,
         "local": local,
         "api_base": api_base,
@@ -264,9 +270,18 @@ def build(config: dict) -> tuple[Runtime, Agent]:
             large_result_preview_chars=config["large_result_preview_chars"],
             compaction_trigger_ratio=config["compaction_trigger_ratio"],
             compaction_keep_recent_ratio=config["compaction_keep_recent_ratio"],
+            max_parallel_tool_calls=config["max_parallel_tools"],
         ),
     )
-    runtime = Runtime(provider, hooks=build_hooks(), result_processor=result_processor, compactor=compactor)
+    hooks = build_hooks()
+    # Concurrency-safe tools in one model response run at the same time; the rest stay in order.
+    # A custom executor must be given the hooks itself (Runtime only wires them into its default).
+    executor = (
+        ParallelToolExecutor(hooks=hooks, max_total=config["max_parallel_tools_total"])
+        if config["parallel_tools"] else None
+    )
+    runtime = Runtime(provider, hooks=hooks, tool_executor=executor, result_processor=result_processor,
+                      compactor=compactor)
     return runtime, agent
 
 
@@ -349,13 +364,15 @@ async def main() -> int:
     logger.info(
         "config loaded: model=%s provider=%s max_steps=%d timeout=%.0fs settings=%s "
         "max_retries=%d max_execution_time=%s repeat_call=%s/%d max_context_tokens=%s "
-        "large_result_handling=%s (per_call=%d per_step=%d) compaction=%s (trigger=%.0f%% keep_recent=%.0f%% model=%s)",
+        "large_result_handling=%s (per_call=%d per_step=%d) compaction=%s (trigger=%.0f%% keep_recent=%.0f%% model=%s) "
+        "parallel_tools=%s (max %d at once)",
         config["model"], "local" if config["local"] else "litellm", config["max_steps"], config["timeout"],
         config["settings"], config["max_retries"], config["max_execution_time"] or "none",
         config["repeat_call_action"], config["repeat_call_threshold"], config["max_context_tokens"] or "none",
         config["large_result_handling"], config["large_result_per_call_tokens"], config["large_result_per_step_tokens"],
         config["compaction"], config["compaction_trigger_ratio"] * 100, config["compaction_keep_recent_ratio"] * 100,
         config["compaction_model"] or "chat model",
+        config["parallel_tools"], config["max_parallel_tools"],
     )
     if config["compaction"] and not config["max_context_tokens"]:
         logger.warning("HARNESS_COMPACTION is on but HARNESS_MAX_CONTEXT_TOKENS is blank: compaction will only "

@@ -248,6 +248,33 @@ Status: Phase 0 proposal. Each phase ends with a **validation gate**: unit tests
 - `ParallelToolExecutor`: tools with `concurrency_safe` run in a bounded semaphore pool; other tools act as barriers; results are committed in model order; each call's failure is isolated.
 - A `gather_agents` helper for concurrent subagents.
 
+### Phase 12 outcome
+
+- **Implemented** `ParallelToolExecutor` in `executor.py`, a subclass of `SequentialToolExecutor`. Both now share two stages: `_prepare` (lookup, validation, `before_tool`) and `_invoke` (tool body + timeout). The sequential executor behaves exactly as before.
+- **Per batch (one model response):** (1) every call is prepared in model order before any body starts, so policy hooks never run concurrently and a denied call simply has its result already; (2) consecutive `concurrency_safe` calls run together under an `asyncio.Semaphore(agent.limits.max_parallel_tool_calls)` (default 10, a sliding pool rather than chunks), while a call that isn't concurrency-safe is a barrier that runs alone after everything before it and before everything after it; (3) `after_tool` runs and results are returned in model order.
+- **Failure isolation:** `_invoke` never raises (except cancellation), so one failure or timeout only affects its own result. Cancelling the run cancels every running call (via `asyncio.TaskGroup`), and transcript repair answers them as before.
+- **Across runs:** `ParallelToolExecutor(max_total=N)` adds an optional semaphore shared by every run using that executor (e.g. many chats on one server). Each run's own batch limit still applies.
+- **Dependent calls** need nothing special: the model only issues calls whose arguments it already knows, so "look up X, then fetch A/B/C for X" naturally becomes one step with one call, then one step with three parallel calls.
+- **`gather_agents` not built:** subagents don't exist until Phase 11; it will be added there.
+- **main.py:** `HARNESS_PARALLEL_TOOLS` (default true), `HARNESS_MAX_PARALLEL_TOOLS` (10), `HARNESS_MAX_PARALLEL_TOOLS_TOTAL` (blank = no cross-run cap). `INSTRUCTIONS` now asks the model to request independent tool calls in the same response. `read_artifact` is marked `concurrency_safe`; the app's tools already were.
+- **No tests written** (explicit instruction). Verified with a scripted provider and timed tool bodies: 4 safe reads ran together (0.4s instead of 1.0s) and came back in model order; an unsafe call waited for the earlier reads and the later reads waited for it; a cap of 3 held with 8 calls; a raising call and a timed-out call didn't affect their neighbours; `before_tool` hooks all ran before any body and `after_tool` ran in order; cancel mid-batch answered every call; a lookup-then-fan-out sequence ran as 1 call then 3 parallel calls; `max_total=3` held across two concurrent runs; the sequential executor was unchanged. With the real model (Gemini), "weather in Paris, Tokyo and London" ran as one step with 3 parallel `get_weather` calls.
+
+## Phase 12b: Human-in-the-Loop (HITL)
+
+*Added 2026-11-06 at the user's request, replacing the Phase 0 decision to defer HITL. To be planned in detail (and reviewed) after Phase 12.*
+
+**Scope (what the user asked for):**
+- **Approve / edit / reject** a tool call before it runs. Edit means the person changes the arguments. Reject comes with a reason the model sees, so it can adjust.
+- **Forms:** the harness, or the model through a tool, asks the person a structured question with options to pick (single or multi-select).
+- **Free-text answer:** the person can answer in their own words instead of picking an option ("Other").
+- **Notes:** the person can attach a note to any response (approve, edit, reject or a form answer), which the model also sees.
+
+**Questions to settle when planning:**
+- Who triggers a request: policy hooks (`before_tool` returning `ask`, or rules on `destructive` annotations) and/or the model through an `ask_user` tool.
+- How the harness waits: an in-process async `InteractionHandler` (the run pauses while connected, e.g. CLI prompt or web UI) and/or suspend-and-resume (the run ends as `AWAITING_INPUT` with a serializable pending request and resumes later with the answer). The second needs the resumable state from Phase 1.
+- Timeouts and defaults (what happens if nobody answers), fail-closed behavior, and events (`interaction.requested` / `interaction.answered`) for the UI.
+- How parallel tool calls from Phase 12 interact: policy and approval stages run serially in model order, before tool bodies run concurrently.
+
 ## Phase 13: MCP
 
 **Build:**
@@ -259,8 +286,7 @@ Status: Phase 0 proposal. Each phase ends with a **validation gate**: unit tests
 
 **Build:**
 - A `ToolPolicy`: allow and deny lists, and rules based on annotations such as "approve `destructive`".
-- ~~`ApprovalHandler` protocol~~: **deferred** (HITL not required for now, per Phase 0 review).
-- An optional `AWAITING_INPUT` suspend-and-resume path.
+- ~~`ApprovalHandler` protocol~~ and the `AWAITING_INPUT` suspend-and-resume path: **moved to Phase 12b (HITL)**.
 - Resource limits.
 - The `Sandbox` protocol (interface only).
 

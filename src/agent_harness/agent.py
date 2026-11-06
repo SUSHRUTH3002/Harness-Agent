@@ -21,6 +21,9 @@ class AgentLimits(BaseModel):
     llm_timeout: float | None = Field(default=None, gt=0)
     # Default per tool call, used only when the tool itself doesn't set Tool.timeout.
     tool_timeout: float | None = Field(default=None, gt=0)
+    # Most concurrency-safe tool calls running at once in one step (ParallelToolExecutor only).
+    # 1 = effectively sequential.
+    max_parallel_tool_calls: int = Field(default=10, ge=1)
     # Consecutive steps issuing the exact same (tool name, arguments) before acting.
     # None disables the guard entirely.
     repeat_call_threshold: int | None = Field(default=3, ge=1)
