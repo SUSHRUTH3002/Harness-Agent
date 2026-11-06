@@ -41,7 +41,7 @@ from agent_harness import (
 from agent_harness.providers.litellm_provider import LiteLLMProvider
 from agent_harness.providers.local_provider import LocalProvider
 from agent_harness.testing import calculator, get_weather, web_search
-from agent_harness.tools_dir.agent_tools import fetch_resource_metadata
+from agent_harness.tools_dir.agent_tools import fetch_resource_metadata, fetch_resource_neighbors
 
 ROOT = Path(__file__).resolve().parent
 # LOG_FORMAT = "%(asctime)s.%(msecs)03d %(levelname)-7s %(name)s: %(message)s"
@@ -229,7 +229,7 @@ def build(config: dict) -> tuple[Runtime, Agent]:
     # Retries live outside the loop entirely, this wrapper is the only thing that changes when retry behavior changes. (refer retry.py)
     provider = ResilientLLMProvider(provider, policy=RetryPolicy(max_retries=config["max_retries"]))
 
-    tools = [calculator, get_weather, web_search, fetch_resource_metadata]
+    tools = [calculator, get_weather, web_search, fetch_resource_metadata, fetch_resource_neighbors]
     result_processor = None
     compactor = None
     if config["large_result_handling"] or config["compaction"]:
