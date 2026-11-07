@@ -24,6 +24,7 @@ from typing import Any, Protocol, runtime_checkable
 from agent_harness.agent import Agent
 from agent_harness.context import CharTokenCounter, TokenCounter
 from agent_harness.errors import ToolError
+from agent_harness.events import EventType, emit_event
 from agent_harness.messages import ToolCall, short_id
 from agent_harness.tools import Tool, ToolAnnotations, ToolContext, ToolResult
 
@@ -159,6 +160,10 @@ class LargeResultProcessor:
         for i in sorted(offload):
             new_results[i] = await self._offload(calls[i], results[i], sizes[i], preview_chars)
             summaries.append(f"{results[i].name} (~{sizes[i]} tokens)")
+            await emit_event(EventType.TOOL_RESULT_OFFLOADED, {
+                "call_id": calls[i].id, "tool": results[i].name, "artifact_id": new_results[i].metadata["artifact_id"],
+                "estimated_tokens": sizes[i], "chars": len(results[i].content),
+            })
         logger.warning(
             "exec=%s step=%d offloaded %d large tool result(s): %s",
             exec_id, step, len(offload), "; ".join(summaries),

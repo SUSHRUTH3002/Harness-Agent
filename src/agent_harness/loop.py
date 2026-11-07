@@ -17,6 +17,7 @@ from agent_harness.cancellation import CancellationToken
 from agent_harness.compaction import Compactor
 from agent_harness.context import ContextManager
 from agent_harness.errors import ErrorCode, ErrorInfo, LLMError
+from agent_harness.events import EventType, emit_event
 from agent_harness.executor import ToolExecutionContext, ToolExecutor
 from agent_harness.hooks import Hooks
 from agent_harness.llm import FinishReason, LLMProvider, LLMRequest, LLMResponse
@@ -92,12 +93,19 @@ class AgentLoop:
             state.step += 1
             logger.info("exec=%s step=%d started (%d/%d this run)", exec_id, state.step, steps_this_run,
                         agent.limits.max_steps)
+            await emit_event(EventType.STEP_STARTED, {"step_in_run": steps_this_run, "max_steps": agent.limits.max_steps})
 
             request = await deps.context.build(agent, state, deps.registry.schemas())
             if deps.compactor is not None and await deps.compactor.maybe_compact(agent, state, request, deps.llm):
                 request = await deps.context.build(agent, state, deps.registry.schemas())
             logger.debug("exec=%s step=%d calling LLM: %d messages, %d tools", exec_id, state.step,
                          len(request.messages), len(request.tools))
+            context_info = request.metadata.get("context", {})
+            await emit_event(EventType.CONTEXT_BUILT, {
+                "messages": len(request.messages), "tools": len(request.tools),
+                "estimated_tokens": context_info.get("estimated_tokens"),
+                "groups_dropped": context_info.get("groups_dropped", 0),
+            })
             started = time.perf_counter()
 
             history_length = len(state.messages)
@@ -115,9 +123,20 @@ class AgentLoop:
             )
             if response.message.text:
                 logger.info("exec=%s step=%d assistant: %s", exec_id, state.step, preview(response.message.text))
+            await emit_event(EventType.LLM_COMPLETED, {
+                "finish_reason": response.finish_reason.value, "latency": round(time.perf_counter() - started, 3),
+                "input_tokens": response.usage.input_tokens, "output_tokens": response.usage.output_tokens,
+                "tool_calls": [c.name for c in calls], "text": preview(response.message.text, 500),
+            })
 
             if response.finish_reason is FinishReason.LENGTH:
-                if self._continue_after_truncation(agent, state, response):
+                continuing = self._continue_after_truncation(agent, state, response)
+                await emit_event(EventType.LLM_TRUNCATED, {
+                    "continuation": state.consecutive_truncations, "limit": agent.limits.max_truncation_continuations,
+                    "dropped_tool_call": bool(calls), "gave_up": not continuing,
+                })
+                await emit_event(EventType.STEP_COMPLETED, {"outcome": "truncated"})
+                if continuing:
                     continue
                 return state
             state.consecutive_truncations = 0
@@ -131,17 +150,21 @@ class AgentLoop:
                     state.append(Message.user(
                         stop_decision.message or "Continue.", metadata={"source": "harness", "reason": "before_stop_hook"}
                     ))
+                    await emit_event(EventType.STEP_COMPLETED, {"outcome": "continued_by_hook"})
                     continue
                 state.result = state.partial_output + response.message.text
                 state.partial_output = ""
                 state.status = RunStatus.COMPLETED
                 logger.info("exec=%s step=%d final answer produced (%d chars)", exec_id, state.step,
                             len(state.result))
+                await emit_event(EventType.STEP_COMPLETED, {"outcome": "final_answer"})
                 return state
 
             state.partial_output = ""
             await self._execute_tools(calls, state, deps, agent)
-            if self._check_repeated_calls(agent, state, calls):
+            stopped = await self._check_repeated_calls(agent, state, calls)
+            await emit_event(EventType.STEP_COMPLETED, {"outcome": "tool_calls", "tool_calls": len(calls)})
+            if stopped:
                 return state
 
     async def _generate_with_overflow_retry(
@@ -178,20 +201,27 @@ class AgentLoop:
         This is a hard per-agent cap, separate from any retry/timeout a provider
         is itself wrapped with (e.g. `ResilientLLMProvider`); it never retries.
         """
-        if agent.limits.llm_timeout is None:
-            return await deps.llm.generate(request)
+        await emit_event(EventType.LLM_STARTED, {
+            "model": request.model, "messages": len(request.messages), "tools": len(request.tools),
+        })
         try:
-            async with asyncio.timeout(agent.limits.llm_timeout):
+            if agent.limits.llm_timeout is None:
                 return await deps.llm.generate(request)
-        except asyncio.CancelledError:
+            try:
+                async with asyncio.timeout(agent.limits.llm_timeout):
+                    return await deps.llm.generate(request)
+            except TimeoutError as exc:
+                raise LLMError(
+                    f"LLM call exceeded agent.limits.llm_timeout ({agent.limits.llm_timeout:.0f}s)",
+                    code=ErrorCode.TIMEOUT,
+                ) from exc
+        except LLMError as exc:
+            await emit_event(EventType.LLM_FAILED, {
+                "code": exc.code, "message": exc.message, "attempts": exc.details.get("attempts", 1),
+            })
             raise
-        except TimeoutError as exc:
-            raise LLMError(
-                f"LLM call exceeded agent.limits.llm_timeout ({agent.limits.llm_timeout:.0f}s)",
-                code=ErrorCode.TIMEOUT,
-            ) from exc
 
-    def _check_repeated_calls(self, agent: Agent, state: AgentState, calls: list[ToolCall]) -> bool:
+    async def _check_repeated_calls(self, agent: Agent, state: AgentState, calls: list[ToolCall]) -> bool:
         """Detect the model issuing the same tool call(s) repeatedly. Returns True if the run stopped.
 
         Tracked as a signature of the *previous* step's calls against this step's,
@@ -212,6 +242,9 @@ class AgentLoop:
             return False
 
         names = ", ".join(sorted({c.name for c in calls}))
+        await emit_event(EventType.GUARD_REPEATED_CALL, {
+            "tools": sorted({c.name for c in calls}), "count": guard["count"], "action": agent.limits.repeat_call_action,
+        })
         if agent.limits.repeat_call_action == "stop":
             logger.error(
                 "exec=%s step=%d stopped: %s called with identical arguments %d times in a row",

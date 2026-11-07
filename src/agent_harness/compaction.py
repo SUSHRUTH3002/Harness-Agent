@@ -31,6 +31,7 @@ from typing import Any, Sequence
 
 from agent_harness.agent import Agent
 from agent_harness.context import CharTokenCounter, TokenCounter, _message_tokens, _segment_history
+from agent_harness.events import EventType, emit_event
 from agent_harness.llm import FinishReason, LLMProvider, LLMRequest, LLMResponse, Usage
 from agent_harness.messages import Message, Role, short_id, utcnow
 from agent_harness.results import ArtifactStore
@@ -265,12 +266,17 @@ class Compactor:
         if tail_start is None:
             logger.warning("exec=%s step=%d compaction (%s): nothing to compact -- the recent tail is all there is",
                            exec_id, state.step, reason)
+            await emit_event(EventType.COMPACTION_SKIPPED, {"reason": reason, "why": "nothing_to_compact"})
             return False
 
         region = state.messages[start:tail_start]
         region_tokens = sum(_message_tokens(m, counter) for m in region)
         previous_summary = data.get("summary")
         count = data.get("count", 0) + 1
+        await emit_event(EventType.COMPACTION_STARTED, {
+            "reason": reason, "region": count, "messages": [start, tail_start - 1],
+            "region_tokens": region_tokens, "context_tokens": current_tokens,
+        })
 
         try:
             summary = await self._summarize(agent, llm, region, start, previous_summary)
@@ -283,10 +289,15 @@ class Compactor:
                 "(Phase 3 dropping still applies; next attempt from step %d): %s",
                 exec_id, state.step, reason, data["retry_after_step"], exc,
             )
+            await emit_event(EventType.COMPACTION_FAILED, {
+                "reason": reason, "region": count, "error": f"{type(exc).__name__}: {exc}",
+                "retry_after_step": data["retry_after_step"],
+            })
             return False
         if not summary.strip():
             logger.warning("exec=%s step=%d compaction (%s): the model returned an empty summary; skipped",
                            exec_id, state.step, reason)
+            await emit_event(EventType.COMPACTION_SKIPPED, {"reason": reason, "why": "empty_summary"})
             return False
 
         archive = await self._archive(state, region, start, tail_start - 1, region_tokens, count)
@@ -313,6 +324,11 @@ class Compactor:
             exec_id, state.step, start, tail_start - 1, region_tokens, ", ".join(_tool_names(region)) or "none",
             summary_tokens, f", archived as '{archive['artifact_id']}'" if archive else "", current_tokens, after,
         )
+        await emit_event(EventType.COMPACTION_COMPLETED, {
+            "reason": reason, "region": count, "messages": [start, tail_start - 1], "region_tokens": region_tokens,
+            "summary_tokens": summary_tokens, "archive_id": archive["artifact_id"] if archive else None,
+            "tools": _tool_names(region), "context_tokens_before": current_tokens, "context_tokens_after": after,
+        })
         return True
 
     def _tail_start(self, messages: Sequence[Message], start: int, keep_tokens: int) -> int | None:

@@ -20,6 +20,7 @@ from pydantic import ValidationError as PydanticValidationError
 
 from agent_harness.cancellation import CancellationToken
 from agent_harness.errors import ErrorCode, ValidationError
+from agent_harness.events import emit_event
 from agent_harness.llm import ToolSchema
 
 logger = logging.getLogger(__name__)
@@ -48,6 +49,13 @@ class ToolContext(BaseModel):
     # Cooperative cancellation signal (see cancellation.py). 
     cancel: CancellationToken = Field(default_factory=CancellationToken)
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    async def emit(self, name: str, data: dict[str, Any] | None = None) -> None:
+        """Report something from inside a tool, e.g. `await ctx.emit("progress", {"pct": 40})`.
+
+        Emitted as `tool.<name>`, tagged with this call's id and tool name. A no-op outside a run.
+        """
+        await emit_event(f"tool.{name}", {"call_id": self.call_id, "tool": self.tool_name, **(data or {})})
 
 
 class ToolResult(BaseModel):

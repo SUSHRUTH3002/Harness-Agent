@@ -291,13 +291,14 @@ class Observer(Protocol):
     async def on_event(self, event: Event) -> None: ...
 ```
 
-- **Event types:**
-  - `runtime.started|completed`
-  - `agent.started|completed`
-  - `agent.step.started|completed`
-  - `context.created`
-  - `llm.started|completed|failed|retrying`
-  - `tool.started|completed|failed`
-  - `error.occurred`
-  - `llm.token`: transient, Phase 8, never persisted
+- **As built (Phase 5):** the event also has `seq` (per-run order), `transient` and `schema_version`; `payload` is named `data`. `type` is an open dotted string -- any phase, app or tool may emit new types via `emit_event()` / `ToolContext.emit()`.
+- **Event types emitted by the harness:**
+  - `run.started|completed`
+  - `step.started|completed`
+  - `context.built`
+  - `llm.started|completed|failed|retrying|truncated`
+  - `tool.started|completed`, `tools.parallel_group`, `tool.result_offloaded`, `tool.<custom>` from tools
+  - `compaction.started|completed|skipped|failed`
+  - `guard.repeated_call`
+- **Reserved:** `approval.requested|resolved` (12b), `llm.delta` (Phase 8, transient, never persisted), `checkpoint.saved` (9), `subagent.started|completed` (11).
 - **Delivery:** in order, awaited per observer. A timeout or exception in an observer is logged and swallowed. Observers cannot veto (D7).

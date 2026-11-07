@@ -21,6 +21,7 @@ from agent_harness.cancellation import CancellationToken
 from agent_harness.compaction import Compactor
 from agent_harness.context import ContextManager, DefaultContextManager
 from agent_harness.errors import ErrorCode, ErrorInfo, HarnessError, ValidationError
+from agent_harness.events import EventBus, EventType, ObserverLike, RunEmitter, bind_emitter, unbind_emitter
 from agent_harness.executor import SequentialToolExecutor, ToolExecutor
 from agent_harness.hooks import Hooks
 from agent_harness.llm import LLMProvider, Usage
@@ -106,6 +107,7 @@ class Runtime:
         hooks: Hooks | None = None,
         result_processor: LargeResultProcessor | None = None,
         compactor: Compactor | None = None,
+        events: EventBus | None = None,
     ) -> None:
         if not isinstance(llm, LLMProvider):
             raise TypeError("llm must implement LLMProvider (an async generate(request) method)")
@@ -121,23 +123,66 @@ class Runtime:
         self.result_processor = result_processor
         # None by default: compaction is opt-in (Phase 10) and also needs agent.limits.max_context_tokens.
         self.compactor = compactor
+        # Observers for every run on this runtime (Phase 5). Per-run observers go to start(observers=...).
+        self.events = events or EventBus()
 
-    def start(self, agent: Agent, input: RunInput | None = None, *, state: AgentState | None = None) -> Execution:
-        """Start a run without waiting for it, returning a cancellable handle."""
+    def start(
+        self,
+        agent: Agent,
+        input: RunInput | None = None,
+        *,
+        state: AgentState | None = None,
+        observers: Sequence[ObserverLike] = (),
+        parent_execution_id: str | None = None,
+    ) -> Execution:
+        """Start a run without waiting for it, returning a cancellable handle.
+
+        `observers` receive this run's events only (on top of `self.events`, which sees every run).
+        """
         resumed = state is not None
         state = self._prepare_state(agent, input, state)
         cancel_token = CancellationToken()
-        task = asyncio.ensure_future(self._execute(agent, state, cancel_token, resumed=resumed))
+        emitter = RunEmitter(
+            execution_id=state.execution_id, agent_id=state.agent_id, bus=self.events, observers=observers,
+            state=state, parent_execution_id=parent_execution_id,
+        )
+        task = asyncio.ensure_future(self._execute(agent, state, cancel_token, emitter, resumed=resumed))
         return Execution(task, cancel_token, state.execution_id)
 
-    async def run(self, agent: Agent, input: RunInput | None = None, *, state: AgentState | None = None) -> RunResult:
-        return await self.start(agent, input, state=state).wait()
+    async def run(
+        self,
+        agent: Agent,
+        input: RunInput | None = None,
+        *,
+        state: AgentState | None = None,
+        observers: Sequence[ObserverLike] = (),
+    ) -> RunResult:
+        return await self.start(agent, input, state=state, observers=observers).wait()
 
-    def run_sync(self, agent: Agent, input: RunInput | None = None, *, state: AgentState | None = None) -> RunResult:
-        return asyncio.run(self.run(agent, input, state=state))
+    def run_sync(
+        self,
+        agent: Agent,
+        input: RunInput | None = None,
+        *,
+        state: AgentState | None = None,
+        observers: Sequence[ObserverLike] = (),
+    ) -> RunResult:
+        return asyncio.run(self.run(agent, input, state=state, observers=observers))
 
     async def _execute(
-        self, agent: Agent, state: AgentState, cancel_token: CancellationToken, *, resumed: bool
+        self, agent: Agent, state: AgentState, cancel_token: CancellationToken, emitter: RunEmitter, *,
+        resumed: bool,
+    ) -> RunResult:
+        # Everything this task runs (loop, executor, tools, retry wrapper) emits through `emitter`.
+        token = bind_emitter(emitter)
+        try:
+            return await self._execute_bound(agent, state, cancel_token, emitter, resumed=resumed)
+        finally:
+            unbind_emitter(token)
+
+    async def _execute_bound(
+        self, agent: Agent, state: AgentState, cancel_token: CancellationToken, emitter: RunEmitter, *,
+        resumed: bool,
     ) -> RunResult:
         registry = ToolRegistry(agent.tools)
         deps = LoopDependencies(
@@ -155,6 +200,10 @@ class Runtime:
         started = time.monotonic()
         state.started_at = state.started_at or utcnow()
         try:
+            await emitter.emit(EventType.RUN_STARTED, {
+                "agent": agent.id, "model": agent.model, "tools": registry.names(),
+                "history_messages": len(state.messages), "resumed": resumed,
+            })
             await registry.setup()
             logger.debug("exec=%s tools ready: %s", exec_id, ", ".join(registry.names()) or "none")
             try:
@@ -202,6 +251,15 @@ class Runtime:
             state.usage.input_tokens, state.usage.output_tokens,
             f" error={state.error.code}" if state.error else "",
         )
+        try:
+            await emitter.emit(EventType.RUN_COMPLETED, {
+                "status": state.status.value, "steps": state.step - steps_before, "duration": round(duration, 3),
+                "input_tokens": state.usage.input_tokens, "output_tokens": state.usage.output_tokens,
+                "output_chars": len(state.result or ""),
+                "error": state.error.model_dump(include={"code", "message", "type"}) if state.error else None,
+            })
+        except asyncio.CancelledError:
+            pass  # cancelled again while reporting; the result below is still correct
         return RunResult(
             execution_id=state.execution_id,
             agent_id=state.agent_id,

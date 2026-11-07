@@ -16,6 +16,7 @@ from typing import Awaitable, Callable
 from pydantic import BaseModel, Field
 
 from agent_harness.errors import ErrorCode, LLMError
+from agent_harness.events import EventType, emit_event
 from agent_harness.llm import LLMProvider, LLMRequest, LLMResponse
 
 logger = logging.getLogger(__name__)
@@ -89,6 +90,7 @@ class ResilientLLMProvider:
 
             elapsed = time.perf_counter() - started
             if not self.policy.should_retry(error, attempt):
+                error.details.setdefault("attempts", attempt + 1)
                 logger.warning(
                     "llm call failed permanently after %d attempt(s), %.2fs: [%s] %s",
                     attempt + 1, elapsed, error.code, error.message,
@@ -100,4 +102,8 @@ class ResilientLLMProvider:
                 "llm call failed (attempt %d/%d, %.2fs): [%s] %s -- retrying in %.1fs",
                 attempt, self.policy.max_retries, elapsed, error.code, error.message, delay,
             )
+            await emit_event(EventType.LLM_RETRYING, {
+                "attempt": attempt, "max_retries": self.policy.max_retries, "code": error.code,
+                "message": error.message, "delay": round(delay, 2), "elapsed": round(elapsed, 3),
+            })
             await self._sleep(delay)

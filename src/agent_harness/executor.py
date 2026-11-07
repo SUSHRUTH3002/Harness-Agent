@@ -15,6 +15,7 @@ from typing import Any, Protocol, Sequence, runtime_checkable
 
 from agent_harness.cancellation import CancellationToken
 from agent_harness.errors import ErrorCode, HarnessError, ValidationError
+from agent_harness.events import EventType, emit_event
 from agent_harness.hooks import Hooks
 from agent_harness.messages import ToolCall, preview, short_id
 from agent_harness.registry import ToolRegistry
@@ -78,6 +79,21 @@ def _log_started(call: ToolCall, context: ToolExecutionContext) -> None:
     )
 
 
+async def _emit_started(call: ToolCall, prepared: _PreparedCall) -> None:
+    """`tool.started`: the tool body is about to run (calls stopped by `_prepare` never start)."""
+    await emit_event(EventType.TOOL_STARTED, {"call_id": call.id, "tool": call.name, "arguments": prepared.arguments})
+
+
+async def _emit_completed(call: ToolCall, result: ToolResult, elapsed: float, ran: bool) -> None:
+    """`tool.completed`: the final result, after `after_tool`. `ran` is False for a call
+    rejected before its body started (unknown tool, invalid arguments, denied)."""
+    await emit_event(EventType.TOOL_COMPLETED, {
+        "call_id": call.id, "tool": call.name, "ok": not result.is_error, "error_code": result.error_code,
+        "ran": ran, "duration": round(elapsed, 3), "content_chars": len(result.content),
+        "content": preview(result.content, 500),
+    })
+
+
 def _log_finished(call: ToolCall, result: ToolResult, context: ToolExecutionContext, elapsed: float) -> None:
     exec_id = short_id(context.execution_id)
     if result.is_error:
@@ -114,9 +130,16 @@ class SequentialToolExecutor:
         started = time.perf_counter()
         _log_started(call, context)
         prepared, ctx = await self._prepare(call, registry, context)
-        result = prepared if isinstance(prepared, ToolResult) else await self._invoke(call, prepared, ctx, context)
+        ran = not isinstance(prepared, ToolResult)
+        if ran:
+            await _emit_started(call, prepared)
+            result = await self._invoke(call, prepared, ctx, context)
+        else:
+            result = prepared
         result = await self.hooks.run_after_tool(call, result, ctx)
-        _log_finished(call, result, context, time.perf_counter() - started)
+        elapsed = time.perf_counter() - started
+        _log_finished(call, result, context, elapsed)
+        await _emit_completed(call, result, elapsed, ran)
         return result
 
     async def _prepare(
@@ -229,6 +252,7 @@ class ParallelToolExecutor(SequentialToolExecutor):
         results: list[ToolResult | None] = [None] * len(calls)
         contexts: list[ToolContext | None] = [None] * len(calls)
         started: list[float] = [0.0] * len(calls)
+        ran: list[bool] = [False] * len(calls)
 
         # 1. Prepare, in order.
         runnable: list[tuple[int, _PreparedCall]] = []
@@ -246,6 +270,8 @@ class ParallelToolExecutor(SequentialToolExecutor):
 
         async def run(i: int, prepared: _PreparedCall) -> None:
             async with limit:
+                ran[i] = True
+                await _emit_started(calls[i], prepared)
                 if self._total is None:
                     results[i] = await self._invoke(calls[i], prepared, contexts[i], context)
                 else:
@@ -261,6 +287,10 @@ class ParallelToolExecutor(SequentialToolExecutor):
                 logger.info("exec=%s step=%d running %d tool call(s) in parallel (max %d at once): %s",
                             exec_id, context.step, len(group), context.max_parallel_tool_calls,
                             ", ".join(calls[i].name for i, _ in group))
+                await emit_event(EventType.TOOLS_PARALLEL_GROUP, {
+                    "count": len(group), "max_at_once": context.max_parallel_tool_calls,
+                    "tools": [calls[i].name for i, _ in group], "call_ids": [calls[i].id for i, _ in group],
+                })
             async with asyncio.TaskGroup() as tasks:
                 for i, prepared in group:
                     tasks.create_task(run(i, prepared))
@@ -280,6 +310,8 @@ class ParallelToolExecutor(SequentialToolExecutor):
         final: list[ToolResult] = []
         for i, call in enumerate(calls):
             result = await self.hooks.run_after_tool(call, results[i], contexts[i])
-            _log_finished(call, result, context, time.perf_counter() - started[i])
+            elapsed = time.perf_counter() - started[i]
+            _log_finished(call, result, context, elapsed)
+            await _emit_completed(call, result, elapsed, ran[i])
             final.append(result)
         return final

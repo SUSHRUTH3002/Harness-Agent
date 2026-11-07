@@ -26,10 +26,13 @@ from agent_harness import (
     AgentLimits,
     AgentState,
     Compactor,
+    EventBus,
     FileArtifactStore,
     Hooks,
+    JsonlEventWriter,
     LargeResultProcessor,
     ParallelToolExecutor,
+    PrintObserver,
     ResilientLLMProvider,
     RetryPolicy,
     Role,
@@ -205,6 +208,9 @@ def load_config() -> dict:
         "parallel_tools": _bool("HARNESS_PARALLEL_TOOLS", True),
         "max_parallel_tools": _number("HARNESS_MAX_PARALLEL_TOOLS", int, 10),
         "max_parallel_tools_total": _number("HARNESS_MAX_PARALLEL_TOOLS_TOTAL", int),
+        # Phase 5: events
+        "events_file": _env("HARNESS_EVENTS_FILE"),
+        "print_events": _bool("HARNESS_PRINT_EVENTS"),
         "model": model,
         "local": local,
         "api_base": api_base,
@@ -280,8 +286,14 @@ def build(config: dict) -> tuple[Runtime, Agent]:
         ParallelToolExecutor(hooks=hooks, max_total=config["max_parallel_tools_total"])
         if config["parallel_tools"] else None
     )
+    # Observers here see every run; an app can also pass observers=[...] to runtime.run() for one run.
+    events = EventBus()
+    if config["events_file"]:
+        events.subscribe(JsonlEventWriter(config["events_file"]))
+    if config["print_events"]:
+        events.subscribe(PrintObserver())
     runtime = Runtime(provider, hooks=hooks, tool_executor=executor, result_processor=result_processor,
-                      compactor=compactor)
+                      compactor=compactor, events=events)
     return runtime, agent
 
 
@@ -365,14 +377,15 @@ async def main() -> int:
         "config loaded: model=%s provider=%s max_steps=%d timeout=%.0fs settings=%s "
         "max_retries=%d max_execution_time=%s repeat_call=%s/%d max_context_tokens=%s "
         "large_result_handling=%s (per_call=%d per_step=%d) compaction=%s (trigger=%.0f%% keep_recent=%.0f%% model=%s) "
-        "parallel_tools=%s (max %d at once)",
+        "parallel_tools=%s (max %d at once) events_file=%s print_events=%s",
         config["model"], "local" if config["local"] else "litellm", config["max_steps"], config["timeout"],
         config["settings"], config["max_retries"], config["max_execution_time"] or "none",
         config["repeat_call_action"], config["repeat_call_threshold"], config["max_context_tokens"] or "none",
         config["large_result_handling"], config["large_result_per_call_tokens"], config["large_result_per_step_tokens"],
         config["compaction"], config["compaction_trigger_ratio"] * 100, config["compaction_keep_recent_ratio"] * 100,
         config["compaction_model"] or "chat model",
-        config["parallel_tools"], config["max_parallel_tools"],
+        config["parallel_tools"], config["max_parallel_tools"], config["events_file"] or "none",
+        config["print_events"],
     )
     if config["compaction"] and not config["max_context_tokens"]:
         logger.warning("HARNESS_COMPACTION is on but HARNESS_MAX_CONTEXT_TOKENS is blank: compaction will only "

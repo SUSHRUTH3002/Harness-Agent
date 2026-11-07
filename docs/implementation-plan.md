@@ -159,6 +159,17 @@ Status: Phase 0 proposal. Each phase ends with a **validation gate**: unit tests
 - A failing observer does not affect the run.
 - Every event carries its IDs.
 
+**Outcome (done):**
+- `events.py`: `Event` (id, type, seq, timestamp, execution_id, agent_id, parent_execution_id, step, data, transient, schema_version), `EventBus`, `Subscription` (fnmatch type filters, `unsubscribe()`), `RunEmitter`, `emit_event()`, `current_emitter()`, `JsonlEventWriter`, `PrintObserver`.
+- **Open vocabulary:** `type` is a dotted string and `data` a free dict, so later phases add events without touching `events.py`. `EventType` only names the built-in ones.
+- **No plumbing:** `Runtime` binds the run's `RunEmitter` to a context variable for the run's task; tasks it starts (parallel tools, worker threads) inherit it. Any code inside the run calls `emit_event(...)`; outside a run it is a no-op. Tools use `ctx.emit("progress", {...})` -> `tool.progress`.
+- **Two levels of observers:** `Runtime(events=EventBus())` sees every run; `runtime.run(..., observers=[...])` sees one run (one chat's UI).
+- **Delivery:** in `seq` order (a per-run lock keeps concurrent parallel-tool emits ordered), awaited per observer with `observer_timeout` (default 5s); exceptions/timeouts logged and swallowed. An observer emitting from inside `on_event` is delivered directly (no deadlock).
+- **Emitted:** `run.started|completed`, `step.started|completed` (`outcome`: tool_calls / final_answer / truncated / continued_by_hook), `context.built`, `llm.started|completed|failed|retrying|truncated`, `tool.started` (when the body actually starts) / `tool.completed` (after `after_tool`, model order, `ran=false` for calls rejected in `_prepare`), `tools.parallel_group`, `tool.result_offloaded`, `compaction.started|completed|skipped|failed`, `guard.repeated_call`.
+- **Reserved for later phases:** `approval.*` (12b), `llm.delta` (8, `transient=True`), `checkpoint.saved` (9), `subagent.*` (11, with `parent_execution_id`).
+- **Deviations from the plan:** names simplified (`run.*`/`step.*` instead of `runtime.*`/`agent.*`/`agent.step.*`); `error.occurred` folded into `run.completed.error` and `llm.failed`; `context.created` is `context.built`. Log lines are unchanged; events are additive. No tests (per the standing instruction); verified with a scratchpad script and a real Gemini run.
+- **main.py:** `HARNESS_EVENTS_FILE` (JSONL) and `HARNESS_PRINT_EVENTS`.
+
 ## Phase 6: Observability
 
 **Build:**

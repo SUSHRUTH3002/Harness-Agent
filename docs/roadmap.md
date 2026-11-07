@@ -7,7 +7,7 @@
 | 2 | Reliability & execution control | **Done** (retry/timeout middleware, cancellation, transcript repair, repeated-call guard) | Yes |
 | 3 | Context management | **Done** (token budget, ordered prompt sections, oldest-group reduction, overflow) | Yes |
 | 4 | Tool execution pipeline (hooks) | **Done** (`before_step`, `before_tool`, `after_tool`, `before_stop` -- `wrap_llm`/`transform_request`/`wrap_tool` served by existing composition, not a second hook list) | Yes |
-| 5 | Event system | Not started | Yes |
+| 5 | Event system | **Done** (`EventBus` + per-run observers, open dotted event types, `emit_event` from anywhere in a run via a context variable, ordered `seq`, isolated observers, `JsonlEventWriter` / `PrintObserver`) | Yes |
 | 6 | Observability | Not started | Yes |
 | 7 | Large result handling | **Done** (offload oversized/combined results to an `ArtifactStore` + `read_artifact`; no "summarize" strategy, see outcome notes) | Likely |
 | 8 | Streaming | Not started | Likely |
