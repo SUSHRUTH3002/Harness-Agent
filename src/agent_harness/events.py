@@ -62,6 +62,10 @@ class EventType:
     COMPACTION_SKIPPED = "compaction.skipped"
     COMPACTION_FAILED = "compaction.failed"
     GUARD_REPEATED_CALL = "guard.repeated_call"
+    TOOL_AWAITING_INPUT = "tool.awaiting_input"
+    TOOL_DEFERRED = "tool.deferred"
+    INTERACTION_REQUESTED = "interaction.requested"
+    INTERACTION_RESOLVED = "interaction.resolved"
 
 
 class Event(BaseModel):
@@ -191,12 +195,19 @@ class RunEmitter:
         self._timeout = bus.observer_timeout if bus is not None else 5.0
         self._own = [o if isinstance(o, Subscription) else Subscription(o, None, None) for o in observers]
         self._state = state
-        self._seq = 0
+        # Continue numbering when a run is resumed (e.g. after waiting for input): seq is per
+        # execution, not per run() call. Kept in state so it survives save/load.
+        self._seq = self._counter().get("last_seq", 0)
         # Parallel tool tasks emit concurrently; the lock keeps every observer seeing seq order.
         self._lock = asyncio.Lock()
 
+    def _counter(self) -> dict[str, Any]:
+        extensions = getattr(self._state, "extensions", None)
+        return extensions.setdefault("events", {}) if isinstance(extensions, dict) else {}
+
     async def emit(self, type: str, data: dict[str, Any] | None = None, /, *, transient: bool = False) -> Event:
         self._seq += 1
+        self._counter()["last_seq"] = self._seq
         event = Event(
             type=type, seq=self._seq, execution_id=self.execution_id, agent_id=self.agent_id,
             parent_execution_id=self.parent_execution_id,

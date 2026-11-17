@@ -300,5 +300,6 @@ class Observer(Protocol):
   - `tool.started|completed`, `tools.parallel_group`, `tool.result_offloaded`, `tool.<custom>` from tools
   - `compaction.started|completed|skipped|failed`
   - `guard.repeated_call`
-- **Reserved:** `approval.requested|resolved` (12b), `llm.delta` (Phase 8, transient, never persisted), `checkpoint.saved` (9), `subagent.started|completed` (11).
+  - `interaction.requested|resolved`, `tool.awaiting_input`, `tool.deferred` (Phase 12b)
+- **Reserved:** `llm.delta` (Phase 8, transient, never persisted), `checkpoint.saved` (9), `subagent.started|completed` (11).
 - **Delivery:** in order, awaited per observer. A timeout or exception in an observer is logged and swallowed. Observers cannot veto (D7).

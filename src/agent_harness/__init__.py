@@ -45,6 +45,15 @@ from agent_harness.executor import (
     ToolExecutionContext,
     ToolExecutor,
 )
+from agent_harness.hitl import (
+    Answer,
+    InputRequired,
+    Interaction,
+    InteractionOption,
+    make_ask_user_tool,
+    pending_interactions,
+)
+from agent_harness.hitl import answer, approve, edit, reject
 from agent_harness.hooks import Hooks, StepDecision, StopDecision, ToolDecision, allow, ask, deny
 from agent_harness.llm import FinishReason, LLMProvider, LLMRequest, LLMResponse, ToolSchema, Usage
 from agent_harness.loop import AgentLoop, LoopDependencies
@@ -61,6 +70,7 @@ __all__ = [
     "AgentLimits",
     "AgentLoop",
     "AgentState",
+    "Answer",
     "ArtifactStore",
     "CancellationToken",
     "CharTokenCounter",
@@ -82,6 +92,9 @@ __all__ = [
     "HarnessTimeoutError",
     "Hooks",
     "InMemoryArtifactStore",
+    "InputRequired",
+    "Interaction",
+    "InteractionOption",
     "JsonlEventWriter",
     "LLMError",
     "LLMProvider",
@@ -122,11 +135,17 @@ __all__ = [
     "Usage",
     "ValidationError",
     "allow",
+    "answer",
+    "approve",
     "ask",
     "compacted_view",
     "current_emitter",
     "deny",
+    "edit",
     "emit_event",
+    "make_ask_user_tool",
     "make_read_artifact_tool",
+    "pending_interactions",
+    "reject",
     "tool",
 ]

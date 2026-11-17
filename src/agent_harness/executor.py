@@ -16,6 +16,16 @@ from typing import Any, Protocol, Sequence, runtime_checkable
 from agent_harness.cancellation import CancellationToken
 from agent_harness.errors import ErrorCode, HarnessError, ValidationError
 from agent_harness.events import EventType, emit_event
+from agent_harness.hitl import (
+    Answer,
+    InputRequired,
+    Interaction,
+    awaiting_result,
+    deferred_result,
+    is_awaiting,
+    rejected_result,
+    with_note,
+)
 from agent_harness.hooks import Hooks
 from agent_harness.messages import ToolCall, preview, short_id
 from agent_harness.registry import ToolRegistry
@@ -36,6 +46,8 @@ class ToolExecutionContext:
     default_tool_timeout: float | None = None
     # Most tool bodies running at once within one batch (ParallelToolExecutor only).
     max_parallel_tool_calls: int = 10
+    # Answers being applied on resume (hitl.py): {call_id: (interaction, answer)}.
+    answers: dict[str, tuple[Interaction, Answer]] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -69,6 +81,8 @@ class _PreparedCall:
 
     tool: Tool
     arguments: dict[str, Any]
+    # The person's approval/edit, when this call was approved on resume (its note goes to the model).
+    approval: Answer | None = None
 
 
 def _log_started(call: ToolCall, context: ToolExecutionContext) -> None:
@@ -92,6 +106,27 @@ async def _emit_completed(call: ToolCall, result: ToolResult, elapsed: float, ra
         "ran": ran, "duration": round(elapsed, 3), "content_chars": len(result.content),
         "content": preview(result.content, 500),
     })
+
+
+async def _report_not_finished(call: ToolCall, result: ToolResult, context: ToolExecutionContext) -> None:
+    """A call that is waiting for a person (or deferred behind one): no after_tool, no tool.completed."""
+    exec_id = short_id(context.execution_id)
+    if result.metadata.get("deferred"):
+        logger.info("exec=%s step=%d tool %s deferred until pending input is answered", exec_id, context.step,
+                    call.name)
+        await emit_event(EventType.TOOL_DEFERRED, {"call_id": call.id, "tool": call.name})
+        return
+    interaction = result.metadata.get("interaction", {})
+    logger.info("exec=%s step=%d tool %s awaiting %s: %s", exec_id, context.step, call.name,
+                interaction.get("kind", "input"), preview(result.content))
+    await emit_event(EventType.TOOL_AWAITING_INPUT, {
+        "call_id": call.id, "tool": call.name, "interaction_id": interaction.get("id"), "kind": interaction.get("kind"),
+    })
+
+
+def _concurrency_safe(registry: ToolRegistry, call: ToolCall) -> bool:
+    tool = registry.get(call.name)
+    return tool is not None and tool.concurrency_safe
 
 
 def _log_finished(call: ToolCall, result: ToolResult, context: ToolExecutionContext, elapsed: float) -> None:
@@ -124,18 +159,31 @@ class SequentialToolExecutor:
     async def execute(
         self, calls: Sequence[ToolCall], registry: ToolRegistry, context: ToolExecutionContext
     ) -> list[ToolResult]:
-        return [await self.execute_one(call, registry, context) for call in calls]
+        results: list[ToolResult] = []
+        for call in calls:
+            # Once a call is waiting for a person, later non-concurrency-safe calls wait too:
+            # they may depend on it. (They are still checked, so their own approvals are asked now.)
+            hold = any(is_awaiting(r) for r in results) and not _concurrency_safe(registry, call)
+            results.append(await self.execute_one(call, registry, context, hold=hold))
+        return results
 
-    async def execute_one(self, call: ToolCall, registry: ToolRegistry, context: ToolExecutionContext) -> ToolResult:
+    async def execute_one(
+        self, call: ToolCall, registry: ToolRegistry, context: ToolExecutionContext, *, hold: bool = False
+    ) -> ToolResult:
         started = time.perf_counter()
         _log_started(call, context)
         prepared, ctx = await self._prepare(call, registry, context)
         ran = not isinstance(prepared, ToolResult)
-        if ran:
+        if ran and hold:
+            result = deferred_result(call.id, call.name)
+        elif ran:
             await _emit_started(call, prepared)
             result = await self._invoke(call, prepared, ctx, context)
         else:
             result = prepared
+        if is_awaiting(result):
+            await _report_not_finished(call, result, context)
+            return result
         result = await self.hooks.run_after_tool(call, result, ctx)
         elapsed = time.perf_counter() - started
         _log_finished(call, result, context, elapsed)
@@ -163,27 +211,52 @@ class SequentialToolExecutor:
                 call.id, call.name, f"Unknown tool '{call.name}'. Available tools: {available}", ErrorCode.UNKNOWN_TOOL
             ), ctx
 
+        # Resuming after a person answered this call (hitl.py).
+        interaction, answer = context.answers.get(call.id, (None, None))
+        if answer is not None and answer.action == "reject":
+            logger.info("exec=%s step=%d tool %s rejected by the user", short_id(context.execution_id),
+                        context.step, call.name)
+            return rejected_result(call.id, call.name, interaction.kind, answer.note), ctx
         try:
-            arguments = tool.validate_arguments(parse_arguments(call))
+            raw = dict(answer.arguments) if answer is not None and answer.action == "edit" else parse_arguments(call)
+            arguments = tool.validate_arguments(raw)
         except HarnessError as exc:
-            return ToolResult.error(call.id, call.name, exc.message, exc.code), ctx
+            message = f"The user's edited arguments are invalid: {exc.message}" if answer is not None else exc.message
+            return ToolResult.error(call.id, call.name, message, exc.code), ctx
+        if answer is not None and interaction.kind == "input":
+            ctx.answer = answer  # the tool runs again, now with the person's answer
+        if answer is not None and answer.action == "edit":
+            call = call.model_copy(update={"arguments": arguments, "raw_arguments": None})
 
         decision = await self.hooks.run_before_tool(call, ctx)
-        if decision.action != "allow":
-            if decision.action == "ask":
-                code, label = ErrorCode.TOOL_APPROVAL_REQUIRED, "requires approval, but no approval handler is configured"
-            else:
-                code, label = ErrorCode.TOOL_DENIED, "denied"
-            message = decision.reason or f"Tool '{call.name}' was {label}."
-            logger.warning("exec=%s step=%d tool %s %s: %s", short_id(context.execution_id), context.step,
-                           call.name, label, message)
-            return ToolResult.error(call.id, call.name, message, code), ctx
-        return _PreparedCall(tool, arguments), ctx
+        approved = answer is not None and interaction.kind == "approval"
+        if decision.action == "ask" and not approved:
+            message = decision.reason or f"Tool '{call.name}' requires approval before it runs."
+            logger.warning("exec=%s step=%d tool %s needs approval: %s", short_id(context.execution_id),
+                           context.step, call.name, message)
+            return awaiting_result(Interaction(
+                kind="approval", call_id=call.id, tool=call.name, arguments=arguments, message=message,
+                allow_edit=decision.allow_edit, step=context.step,
+            )), ctx
+        if decision.action == "deny":
+            message = decision.reason or f"Tool '{call.name}' was denied."
+            logger.warning("exec=%s step=%d tool %s denied: %s", short_id(context.execution_id), context.step,
+                           call.name, message)
+            return ToolResult.error(call.id, call.name, message, ErrorCode.TOOL_DENIED), ctx
+        return _PreparedCall(tool, arguments, approval=answer if approved else None), ctx
 
     async def _invoke(
         self, call: ToolCall, prepared: _PreparedCall, ctx: ToolContext, context: ToolExecutionContext
     ) -> ToolResult:
         """Run the tool body with its timeout. Never raises, except for cancellation."""
+        result = await self._run_body(call, prepared, ctx, context)
+        if prepared.approval is not None and not is_awaiting(result):
+            result = with_note(result, prepared.approval)
+        return result
+
+    async def _run_body(
+        self, call: ToolCall, prepared: _PreparedCall, ctx: ToolContext, context: ToolExecutionContext
+    ) -> ToolResult:
         tool = prepared.tool
         timeout = tool.timeout if tool.timeout is not None else context.default_tool_timeout
         try:
@@ -198,6 +271,12 @@ class SequentialToolExecutor:
             return ToolResult.error(
                 call.id, call.name, f"Tool '{call.name}' timed out after {timeout:.0f}s", ErrorCode.TIMEOUT
             )
+        except InputRequired as exc:
+            return awaiting_result(Interaction(
+                kind="input", call_id=call.id, tool=call.name, arguments=prepared.arguments, message=exc.message,
+                options=exc.options, multi_select=exc.multi_select, allow_free_text=exc.allow_free_text,
+                step=context.step, metadata=exc.metadata,
+            ))
         except HarnessError as exc:
             return ToolResult.error(call.id, call.name, exc.message, exc.code)
         except Exception as exc:
@@ -301,6 +380,10 @@ class ParallelToolExecutor(SequentialToolExecutor):
                 group.append((i, prepared))
                 continue
             await flush()
+            if any(r is not None and is_awaiting(r) for r in results[:i]):
+                # Something before this call is waiting for a person; it may depend on it.
+                results[i] = deferred_result(calls[i].id, calls[i].name)
+                continue
             logger.debug("exec=%s step=%d tool %s is not concurrency-safe; running it alone",
                          exec_id, context.step, calls[i].name)
             await run(i, prepared)
@@ -309,6 +392,10 @@ class ParallelToolExecutor(SequentialToolExecutor):
         # 3. Finish, in order.
         final: list[ToolResult] = []
         for i, call in enumerate(calls):
+            if is_awaiting(results[i]):
+                await _report_not_finished(call, results[i], context)
+                final.append(results[i])
+                continue
             result = await self.hooks.run_after_tool(call, results[i], contexts[i])
             elapsed = time.perf_counter() - started[i]
             _log_finished(call, result, context, elapsed)

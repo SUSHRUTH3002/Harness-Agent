@@ -12,3 +12,5 @@ build/
 .references
 
 .events/
+.sessions/
+data/

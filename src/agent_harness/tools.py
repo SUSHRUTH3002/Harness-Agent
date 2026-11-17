@@ -49,6 +49,9 @@ class ToolContext(BaseModel):
     # Cooperative cancellation signal (see cancellation.py). 
     cancel: CancellationToken = Field(default_factory=CancellationToken)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    # The person's hitl.Answer when this call is being resumed after asking for input, else None.
+    # (Typed Any: hitl.py builds on this module.)
+    answer: Any = None
 
     async def emit(self, name: str, data: dict[str, Any] | None = None) -> None:
         """Report something from inside a tool, e.g. `await ctx.emit("progress", {"pct": 40})`.

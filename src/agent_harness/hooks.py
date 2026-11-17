@@ -32,6 +32,8 @@ logger = logging.getLogger(__name__)
 class ToolDecision:
     action: Literal["allow", "deny", "ask"]
     reason: str | None = None
+    # ask only: may the person change the arguments before approving.
+    allow_edit: bool = True
 
 
 def allow() -> ToolDecision:
@@ -42,12 +44,14 @@ def deny(reason: str) -> ToolDecision:
     return ToolDecision("deny", reason)
 
 
-def ask(reason: str | None = None) -> ToolDecision:
-    """Request human approval. No approval mechanism exists yet (Phase 0 review:
-    human-in-the-loop deferred), so this currently resolves to a denial -- the
-    same fail-closed default DeepSeek and TrueForge both use when no approval
-    handler is configured."""
-    return ToolDecision("ask", reason)
+def ask(reason: str | None = None, *, allow_edit: bool = True) -> ToolDecision:
+    """Require a person's approval before this call runs (Phase 12b, hitl.py).
+
+    The run suspends with status AWAITING_INPUT; the person approves, edits the
+    arguments (unless `allow_edit=False`) or rejects, optionally with a note, and
+    `runtime.resume(...)` continues. On resume the same hook may say `ask` again for
+    that call; the person's answer stands. A `deny` from any hook still wins."""
+    return ToolDecision("ask", reason, allow_edit)
 
 
 BeforeToolHook = Callable[[ToolCall, ToolContext], Union[ToolDecision, None, Awaitable[Union[ToolDecision, None]]]]

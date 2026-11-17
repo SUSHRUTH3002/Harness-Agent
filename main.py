@@ -25,10 +25,12 @@ from agent_harness import (
     Agent,
     AgentLimits,
     AgentState,
+    Answer,
     Compactor,
     EventBus,
     FileArtifactStore,
     Hooks,
+    Interaction,
     JsonlEventWriter,
     LargeResultProcessor,
     ParallelToolExecutor,
@@ -37,11 +39,19 @@ from agent_harness import (
     RetryPolicy,
     Role,
     RunResult,
+    RunStatus,
     Runtime,
     allow,
+    answer,
+    approve,
+    ask,
     deny,
+    edit,
+    make_ask_user_tool,
     make_read_artifact_tool,
+    reject,
 )
+from agent_harness import pending_interactions as pending_interactions_of
 from agent_harness.providers.litellm_provider import LiteLLMProvider
 from agent_harness.providers.local_provider import LocalProvider
 from agent_harness.testing import calculator, get_weather, web_search
@@ -65,15 +75,23 @@ litellm.suppress_debug_info = False
 INSTRUCTIONS = (
     "You are a helpful assistant. Use the available tools for weather, arithmetic and search "
     "instead of guessing. When you need several independent pieces of information, request all "
-    "of those tool calls in the same response so they can run in parallel. Answer concisely."
+    "of those tool calls in the same response so they can run in parallel. If you need a decision or "
+    "information only the user has, use ask_user instead of guessing. Answer concisely."
 )
 
 # Banned search terms for the web_search tool. Queries containing these terms will be blocked.
 _BANNED_SEARCH_TERMS = ("bomb", "weapon")
 
 
-def build_hooks() -> Hooks:
+def build_hooks(approval_tools: frozenset[str] = frozenset()) -> Hooks:
     hooks = Hooks()
+
+    # Requires approval for certain tools as specified in HARNESS_APPROVAL_TOOLS.
+    @hooks.on_before_tool
+    def require_approval(call, ctx):
+        if call.name in approval_tools:
+            return ask(f"'{call.name}' is configured to need approval (HARNESS_APPROVAL_TOOLS).")
+        return allow()
 
     @hooks.on_before_tool
     def block_banned_search_terms(call, ctx):
@@ -208,6 +226,10 @@ def load_config() -> dict:
         "parallel_tools": _bool("HARNESS_PARALLEL_TOOLS", True),
         "max_parallel_tools": _number("HARNESS_MAX_PARALLEL_TOOLS", int, 10),
         "max_parallel_tools_total": _number("HARNESS_MAX_PARALLEL_TOOLS_TOTAL", int),
+        # Phase 12b: human-in-the-loop
+        "ask_user": _bool("HARNESS_ASK_USER", True),
+        "approval_tools": frozenset(t.strip() for t in (_env("HARNESS_APPROVAL_TOOLS") or "").split(",") if t.strip()),
+        "sessions_dir": _env("HARNESS_SESSIONS_DIR") or str(ROOT / ".sessions"),
         # Phase 5: events
         "events_file": _env("HARNESS_EVENTS_FILE"),
         "print_events": _bool("HARNESS_PRINT_EVENTS"),
@@ -242,6 +264,8 @@ def build(config: dict) -> tuple[Runtime, Agent]:
     provider = ResilientLLMProvider(provider, policy=RetryPolicy(max_retries=config["max_retries"]))
 
     tools = [calculator, get_weather, web_search, fetch_resource_metadata, fetch_resource_neighbors]
+    if config["ask_user"]:
+        tools.append(make_ask_user_tool())
     result_processor = None
     compactor = None
     if config["large_result_handling"] or config["compaction"]:
@@ -279,7 +303,7 @@ def build(config: dict) -> tuple[Runtime, Agent]:
             max_parallel_tool_calls=config["max_parallel_tools"],
         ),
     )
-    hooks = build_hooks()
+    hooks = build_hooks(config["approval_tools"])
     # Concurrency-safe tools in one model response run at the same time; the rest stay in order.
     # A custom executor must be given the hooks itself (Runtime only wires them into its default).
     executor = (
@@ -316,27 +340,122 @@ def print_summary(result: RunResult) -> None:
     )
 
 
-async def ask(runtime: Runtime, agent: Agent, question: str, state: AgentState | None, quiet: bool) -> RunResult:
-    start = len(state.messages) + 1 if state else 1  # skip the user's own message
-    execution = runtime.start(agent, question, state=state)
+async def run_turn(
+    runtime: Runtime, agent: Agent, question: str | None, state: AgentState | None, quiet: bool,
+    sessions_dir: Path, answers: list[Answer] | None = None,
+) -> RunResult:
+    """Run (or resume) until the run finishes or the person chooses to answer later."""
+    while True:
+        start = len(state.messages) + (1 if question else 0) if state else 1  # skip the user's own message
+        execution = runtime.start(agent, question, state=state, answers=answers or ())
+        try:
+            result = await execution.wait()
+        except KeyboardInterrupt:
+            logger.warning("exec=%s cancelling on Ctrl-C", execution.execution_id[:8])
+            execution.cancel("Ctrl-C")
+            result = await execution.wait()
+        if not quiet:
+            print_transcript(result, start)
+        if result.error:
+            print(f"error [{result.error.code}]: {result.error.message}", file=sys.stderr)
+        if result.output:
+            print(f"\n{result.output}\n")
+        if not quiet:
+            print_summary(result)
+        if not result.awaiting_input:
+            return result
+
+        # Suspended: nothing is kept in memory. Save the state, collect answers, and resume from
+        # the saved file -- exactly what a server does across requests (or a restart).
+        path = save_session(result.state, sessions_dir)
+        answers = collect_answers(result.pending_interactions)
+        if answers is None:
+            print(f"\n(saved; resume any time with: python main.py --resume {path})\n")
+            return result
+        state, question = load_session(path), None
+
+
+def save_session(state: AgentState, sessions_dir: Path) -> Path:
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    path = sessions_dir / f"{state.execution_id}.json"
+    path.write_text(state.model_dump_json(indent=2), encoding="utf-8")
+    return path
+
+
+def load_session(path: Path) -> AgentState:
+    return AgentState.model_validate_json(Path(path).read_text(encoding="utf-8"))
+
+
+def collect_answers(interactions: list[Interaction]) -> list[Answer] | None:
+    """Ask the person in the terminal. Returns None if they choose to answer later."""
+    print(f"\n⏸  The agent needs your input ({len(interactions)} item(s)). Type 'later' to stop and resume later.")
+    answers = []
+    for n, it in enumerate(interactions, 1):
+        print(f"\n[{n}/{len(interactions)}] ", end="")
+        if it.kind == "approval":
+            print(f"APPROVAL  {it.tool} {json.dumps(it.arguments)}\n    {it.message}")
+            hint = "a=approve, e=edit, r=reject" if it.allow_edit else "a=approve, r=reject"
+            while True:
+                choice = _prompt(f"    {hint}> ").lower()
+                if choice == "later":
+                    return None
+                if choice in ("a", "approve"):
+                    answers.append(approve(it.id, note=_prompt("    note (optional)> ") or None))
+                elif choice in ("e", "edit") and it.allow_edit:
+                    raw = _prompt(f"    new arguments as JSON [{json.dumps(it.arguments)}]> ") or json.dumps(it.arguments)
+                    try:
+                        arguments = json.loads(raw)
+                    except json.JSONDecodeError as exc:
+                        print(f"    not valid JSON: {exc.msg}")
+                        continue
+                    answers.append(edit(it.id, arguments, note=_prompt("    note (optional)> ") or None))
+                elif choice in ("r", "reject"):
+                    answers.append(reject(it.id, note=_prompt("    reason / note (optional)> ") or None))
+                else:
+                    continue
+                break
+        else:
+            print(f"QUESTION  {it.message}")
+            for i, o in enumerate(it.options, 1):
+                print(f"    {i}. {o.label}" + (f" -- {o.description}" if o.description else ""))
+            hint = "number" + ("s, comma-separated" if it.multi_select else "") if it.options else ""
+            if it.allow_free_text or not it.options:
+                hint = f"{hint} or your own answer" if hint else "your answer"
+            while True:
+                raw = _prompt(f"    {hint} (r=decline)> ")
+                if raw.lower() == "later":
+                    return None
+                if raw.lower() in ("r", "reject"):
+                    answers.append(reject(it.id, note=_prompt("    note (optional)> ") or None))
+                    break
+                value = _pick(raw, it)
+                if value is None:
+                    print("    please pick one of the numbers" + (" or type an answer" if it.allow_free_text else ""))
+                    continue
+                answers.append(answer(it.id, value, note=_prompt("    note (optional)> ") or None))
+                break
+    return answers
+
+
+def _pick(raw: str, it: Interaction):
+    labels = [o.label for o in it.options]
+    parts = [p.strip() for p in raw.split(",")] if it.multi_select else [raw.strip()]
+    if labels and all(p.isdigit() and 1 <= int(p) <= len(labels) for p in parts):
+        picked = [labels[int(p) - 1] for p in parts]
+        return picked if it.multi_select else picked[0]
+    if raw.strip() and (it.allow_free_text or not labels):
+        return raw.strip()
+    return None
+
+
+def _prompt(text: str) -> str:
     try:
-        result = await execution.wait()
-    except KeyboardInterrupt:
-        logger.warning("exec=%s cancelling on Ctrl-C", execution.execution_id[:8])
-        execution.cancel("Ctrl-C")
-        result = await execution.wait()
-    if not quiet:
-        print_transcript(result, start)
-    if result.error:
-        print(f"error [{result.error.code}]: {result.error.message}", file=sys.stderr)
-    if result.output:
-        print(f"\n{result.output}\n")
-    if not quiet:
-        print_summary(result)
-    return result
+        return input(text).strip()
+    except EOFError:
+        return "later"
 
 
-async def chat(runtime: Runtime, agent: Agent, model: str, quiet: bool) -> None:
+async def chat(runtime: Runtime, agent: Agent, model: str, quiet: bool, sessions_dir: Path) -> None:
     print(f"agent-harness chat — model {model}. Type 'exit' or Ctrl-D to quit, '/reset' to start over.\n")
     state: AgentState | None = None
     while True:
@@ -353,8 +472,9 @@ async def chat(runtime: Runtime, agent: Agent, model: str, quiet: bool) -> None:
             state = None
             print("(conversation cleared)\n")
             continue
-        result = await ask(runtime, agent, question, state, quiet)
-        # Keep history across turns unless the run left unanswered tool calls behind.
+        result = await run_turn(runtime, agent, question, state, quiet, sessions_dir)
+        # Keep history across turns unless the run left unanswered tool calls behind
+        # (a run left waiting for input is saved to a file; resume it with --resume).
         state = None if result.state.pending_tool_calls() else result.state
 
 
@@ -363,6 +483,7 @@ async def main() -> int:
     parser.add_argument("question", nargs="*", help="question to ask; omit for interactive chat")
     parser.add_argument("-q", "--quiet", action="store_true", help="print only the answer (logs: warnings only)")
     parser.add_argument("-v", "--verbose", action="store_true", help="debug logging (overrides HARNESS_LOG_LEVEL)")
+    parser.add_argument("--resume", metavar="FILE", help="resume a run saved while waiting for your input")
     args = parser.parse_args()
 
     try:
@@ -377,7 +498,7 @@ async def main() -> int:
         "config loaded: model=%s provider=%s max_steps=%d timeout=%.0fs settings=%s "
         "max_retries=%d max_execution_time=%s repeat_call=%s/%d max_context_tokens=%s "
         "large_result_handling=%s (per_call=%d per_step=%d) compaction=%s (trigger=%.0f%% keep_recent=%.0f%% model=%s) "
-        "parallel_tools=%s (max %d at once) events_file=%s print_events=%s",
+        "parallel_tools=%s (max %d at once) events_file=%s print_events=%s ask_user=%s approval_tools=%s",
         config["model"], "local" if config["local"] else "litellm", config["max_steps"], config["timeout"],
         config["settings"], config["max_retries"], config["max_execution_time"] or "none",
         config["repeat_call_action"], config["repeat_call_threshold"], config["max_context_tokens"] or "none",
@@ -385,17 +506,28 @@ async def main() -> int:
         config["compaction"], config["compaction_trigger_ratio"] * 100, config["compaction_keep_recent_ratio"] * 100,
         config["compaction_model"] or "chat model",
         config["parallel_tools"], config["max_parallel_tools"], config["events_file"] or "none",
-        config["print_events"],
+        config["print_events"], config["ask_user"], ",".join(sorted(config["approval_tools"])) or "none",
     )
     if config["compaction"] and not config["max_context_tokens"]:
         logger.warning("HARNESS_COMPACTION is on but HARNESS_MAX_CONTEXT_TOKENS is blank: compaction will only "
                        "run if the provider rejects a request as too long")
     runtime, agent = build(config)
 
+    sessions_dir = Path(config["sessions_dir"])
+    if args.resume:
+        state = load_session(Path(args.resume))
+        if state.status is not RunStatus.AWAITING_INPUT:
+            print(f"{args.resume}: run is '{state.status.value}', not waiting for input", file=sys.stderr)
+            return 2
+        answers = collect_answers(pending_interactions_of(state))
+        if answers is None:
+            return 0
+        result = await run_turn(runtime, agent, None, state, args.quiet, sessions_dir, answers)
+        return 0 if result.ok or result.awaiting_input else 1
     if args.question:
-        result = await ask(runtime, agent, " ".join(args.question), None, args.quiet)
-        return 0 if result.ok else 1
-    await chat(runtime, agent, config["model"], args.quiet)
+        result = await run_turn(runtime, agent, " ".join(args.question), None, args.quiet, sessions_dir)
+        return 0 if result.ok or result.awaiting_input else 1
+    await chat(runtime, agent, config["model"], args.quiet, sessions_dir)
     return 0
 
 

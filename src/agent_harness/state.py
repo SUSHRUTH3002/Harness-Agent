@@ -27,6 +27,7 @@ class RunStatus(StrEnum):
     MAX_STEPS = "max_steps"
     CANCELLED = "cancelled"
     TIMED_OUT = "timed_out"
+    AWAITING_INPUT = "awaiting_input"
 
     @property
     def is_terminal(self) -> bool:

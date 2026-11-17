@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Sequence
+from typing import Iterable, Sequence
 
 from pydantic import BaseModel
 
@@ -23,6 +23,7 @@ from agent_harness.context import ContextManager, DefaultContextManager
 from agent_harness.errors import ErrorCode, ErrorInfo, HarnessError, ValidationError
 from agent_harness.events import EventBus, EventType, ObserverLike, RunEmitter, bind_emitter, unbind_emitter
 from agent_harness.executor import SequentialToolExecutor, ToolExecutor
+from agent_harness.hitl import Answer, Interaction, pending_interactions, submit_answers, take_held
 from agent_harness.hooks import Hooks
 from agent_harness.llm import LLMProvider, Usage
 from agent_harness.loop import AgentLoop, LoopDependencies
@@ -52,17 +53,31 @@ class RunResult(BaseModel):
     def ok(self) -> bool:
         return self.status is RunStatus.COMPLETED
 
+    @property
+    def awaiting_input(self) -> bool:
+        return self.status is RunStatus.AWAITING_INPUT
+
+    @property
+    def pending_interactions(self) -> list[Interaction]:
+        """What the person is being asked (empty unless the run is AWAITING_INPUT)."""
+        return pending_interactions(self.state) if self.awaiting_input else []
+
 
 def _repair_transcript(state: AgentState, code: str, message: str) -> None:
     """Give every still-pending tool call a synthetic result.
 
     Called whenever a run ends abnormally (cancelled, timed out, or failed)
     partway through a tool batch, so the saved transcript always has exactly
-    one result per call and stays valid to resend to any provider.
+    one result per call and stays valid to resend to any provider. Calls that had
+    already finished in a suspended batch (hitl.py) keep their real results.
     """
+    held = take_held(state)
+    hitl = state.extensions.get("hitl")
+    if hitl:
+        hitl["pending"], hitl["answers"] = [], {}
     for call in state.pending_tool_calls():
-        result = ToolResult.error(call.id, call.name, message, code)
-        state.append(Message.tool(result.call_id, result.content, name=result.name, is_error=True))
+        result = held.get(call.id) or ToolResult.error(call.id, call.name, message, code)
+        state.append(Message.tool(result.call_id, result.content, name=result.name, is_error=result.is_error))
         state.tool_results.append(result)
 
 
@@ -134,13 +149,15 @@ class Runtime:
         state: AgentState | None = None,
         observers: Sequence[ObserverLike] = (),
         parent_execution_id: str | None = None,
+        answers: Iterable[Answer] = (),
     ) -> Execution:
         """Start a run without waiting for it, returning a cancellable handle.
 
         `observers` receive this run's events only (on top of `self.events`, which sees every run).
+        `answers` respond to a suspended run's pending interactions (see `resume`).
         """
         resumed = state is not None
-        state = self._prepare_state(agent, input, state)
+        state = self._prepare_state(agent, input, state, list(answers))
         cancel_token = CancellationToken()
         emitter = RunEmitter(
             execution_id=state.execution_id, agent_id=state.agent_id, bus=self.events, observers=observers,
@@ -156,8 +173,26 @@ class Runtime:
         *,
         state: AgentState | None = None,
         observers: Sequence[ObserverLike] = (),
+        answers: Iterable[Answer] = (),
     ) -> RunResult:
-        return await self.start(agent, input, state=state, observers=observers).wait()
+        return await self.start(agent, input, state=state, observers=observers, answers=answers).wait()
+
+    async def resume(
+        self,
+        agent: Agent,
+        state: AgentState,
+        answers: Iterable[Answer],
+        *,
+        observers: Sequence[ObserverLike] = (),
+    ) -> RunResult:
+        """Continue a run that ended AWAITING_INPUT, with the person's answers.
+
+        `state` is usually loaded back from storage: `AgentState.model_validate_json(saved)`.
+        Unanswered interactions stay pending (the run suspends again until they are answered).
+        """
+        if state.status is not RunStatus.AWAITING_INPUT:
+            raise ValidationError(f"state is '{state.status.value}', not awaiting input", code=ErrorCode.INVALID_CONFIG)
+        return await self.run(agent, state=state, observers=observers, answers=answers)
 
     def run_sync(
         self,
@@ -244,7 +279,7 @@ class Runtime:
         state.finished_at = utcnow()
         duration = time.monotonic() - started
 
-        log = logger.info if state.status is RunStatus.COMPLETED else logger.warning
+        log = logger.info if state.status in (RunStatus.COMPLETED, RunStatus.AWAITING_INPUT) else logger.warning
         log(
             "exec=%s run finished: status=%s steps=%d duration=%.2fs tokens in=%d out=%d%s",
             exec_id, state.status.value, state.step - steps_before, duration,
@@ -256,6 +291,8 @@ class Runtime:
                 "status": state.status.value, "steps": state.step - steps_before, "duration": round(duration, 3),
                 "input_tokens": state.usage.input_tokens, "output_tokens": state.usage.output_tokens,
                 "output_chars": len(state.result or ""),
+                "pending_interactions": [i.id for i in pending_interactions(state)]
+                if state.status is RunStatus.AWAITING_INPUT else [],
                 "error": state.error.model_dump(include={"code", "message", "type"}) if state.error else None,
             })
         except asyncio.CancelledError:
@@ -285,9 +322,13 @@ class Runtime:
             raise ValidationError("input must be a str, a Message, or a sequence of Messages", code=ErrorCode.INVALID_CONFIG)
         return messages
 
-    def _prepare_state(self, agent: Agent, input: RunInput | None, state: AgentState | None) -> AgentState:
+    def _prepare_state(
+        self, agent: Agent, input: RunInput | None, state: AgentState | None, answers: list[Answer]
+    ) -> AgentState:
         messages = self._normalize_input(input)
         if state is None:
+            if answers:
+                raise ValidationError("answers need the suspended run's state", code=ErrorCode.INVALID_CONFIG)
             if not messages:
                 raise ValidationError("input is required to start a new run", code=ErrorCode.INVALID_CONFIG)
             state = AgentState(agent_id=agent.id)
@@ -297,10 +338,14 @@ class Runtime:
                     f"state belongs to agent '{state.agent_id}', not '{agent.id}'", code=ErrorCode.INVALID_CONFIG
                 )
             if messages and state.pending_tool_calls():
+                waiting = state.status is RunStatus.AWAITING_INPUT
                 raise ValidationError(
-                    "state has unresolved tool calls; resume it without new input first",
+                    "the run is waiting for input; answer its pending interactions with resume() first"
+                    if waiting else "state has unresolved tool calls; resume it without new input first",
                     code=ErrorCode.INVALID_CONFIG,
                 )
+            if answers:
+                submit_answers(state, answers)
             # Continuing a conversation or resuming: clear the previous run's outcome.
             _reset_outcome(state)
         for m in messages:

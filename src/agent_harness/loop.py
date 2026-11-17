@@ -19,6 +19,7 @@ from agent_harness.context import ContextManager
 from agent_harness.errors import ErrorCode, ErrorInfo, LLMError
 from agent_harness.events import EventType, emit_event
 from agent_harness.executor import ToolExecutionContext, ToolExecutor
+from agent_harness.hitl import Interaction, add_pending, get_held, hold_results, is_awaiting, take_answers, take_held
 from agent_harness.hooks import Hooks
 from agent_harness.llm import FinishReason, LLMProvider, LLMRequest, LLMResponse
 from agent_harness.messages import Message, ToolCall, preview, short_id
@@ -68,7 +69,8 @@ class AgentLoop:
         pending = state.pending_tool_calls()
         if pending:
             logger.info("exec=%s resuming: executing %d pending tool call(s) first", exec_id, len(pending))
-            await self._execute_tools(pending, state, deps, agent)
+            if await self._execute_tools(pending, state, deps, agent):
+                return state  # still waiting for a person
 
         steps_this_run = 0
         while True:
@@ -161,7 +163,9 @@ class AgentLoop:
                 return state
 
             state.partial_output = ""
-            await self._execute_tools(calls, state, deps, agent)
+            if await self._execute_tools(calls, state, deps, agent):
+                await emit_event(EventType.STEP_COMPLETED, {"outcome": "awaiting_input", "tool_calls": len(calls)})
+                return state
             stopped = await self._check_repeated_calls(agent, state, calls)
             await emit_event(EventType.STEP_COMPLETED, {"outcome": "tool_calls", "tool_calls": len(calls)})
             if stopped:
@@ -318,10 +322,25 @@ class AgentLoop:
 
     async def _execute_tools(
         self, calls: list[ToolCall], state: AgentState, deps: LoopDependencies, agent: Agent
-    ) -> None:
+    ) -> bool:
+        """Run a batch of calls and commit their results. Returns True if the run must suspend
+        because some call is waiting for a person (hitl.py); nothing is committed then."""
         exec_id = short_id(state.execution_id)
-        logger.info("exec=%s step=%d executing %d tool call(s): %s", exec_id, state.step, len(calls),
-                    ", ".join(c.name for c in calls))
+        # Resuming a suspended batch: calls that already finished keep their results, and the
+        # person's answers are applied to the calls that were waiting.
+        held = get_held(state)
+        answers = take_answers(state)
+        for interaction, answer in answers.values():
+            logger.info("exec=%s step=%d %s for %s answered: %s%s", exec_id, state.step, interaction.kind,
+                        interaction.tool, answer.action, f" (note: {answer.note})" if answer.note else "")
+            await emit_event(EventType.INTERACTION_RESOLVED, {
+                "interaction_id": interaction.id, "kind": interaction.kind, "call_id": interaction.call_id,
+                "tool": interaction.tool, "action": answer.action, "arguments": answer.arguments,
+                "value": answer.value, "note": answer.note, "answered_by": answer.answered_by,
+            })
+        to_run = [c for c in calls if c.id not in held]
+        logger.info("exec=%s step=%d executing %d tool call(s): %s%s", exec_id, state.step, len(to_run),
+                    ", ".join(c.name for c in to_run), f" ({len(held)} already done)" if held else "")
         context = ToolExecutionContext(
             execution_id=state.execution_id,
             agent_id=state.agent_id,
@@ -329,12 +348,13 @@ class AgentLoop:
             cancel=deps.cancel,
             default_tool_timeout=agent.limits.tool_timeout,
             max_parallel_tool_calls=agent.limits.max_parallel_tool_calls,
+            answers=answers,
         )
-        results = await deps.executor.execute(calls, deps.registry, context)
+        results = await deps.executor.execute(to_run, deps.registry, context) if to_run else []
 
         # Enforce the executor contract first, so large-result handling (and everything after
         # it) always sees exactly one real ToolResult per call, in call order.
-        by_id = {r.call_id: r for r in results}
+        by_id = {**held, **{r.call_id: r for r in results}}
         ordered: list[ToolResult] = []
         for call in calls:
             result = by_id.get(call.id)
@@ -344,6 +364,21 @@ class AgentLoop:
                     call.id, call.name, "Tool executor produced no result for this call.", ErrorCode.EXECUTION_ERROR
                 )
             ordered.append(result)
+
+        waiting = [r for r in ordered if is_awaiting(r)]
+        if waiting:
+            hold_results(state, [r for r in ordered if not is_awaiting(r)])
+            for r in waiting:
+                if "interaction" not in r.metadata:
+                    continue  # deferred behind another call; it runs on resume
+                interaction = Interaction.model_validate(r.metadata["interaction"])
+                if add_pending(state, interaction):
+                    await emit_event(EventType.INTERACTION_REQUESTED, interaction.model_dump(mode="json"))
+            state.status = RunStatus.AWAITING_INPUT
+            logger.warning("exec=%s step=%d suspended: waiting for input on %s (%d call(s) done and held)",
+                           exec_id, state.step, ", ".join(r.name for r in waiting), len(ordered) - len(waiting))
+            return True
+        take_held(state)  # the whole batch is being committed now
 
         if deps.result_processor is not None:
             exempt = frozenset(t.name for t in deps.registry if t.exempt_from_offload)
@@ -356,3 +391,4 @@ class AgentLoop:
             state.tool_results.append(result)
         failed = sum(r.is_error for r in ordered)
         logger.info("exec=%s step=%d tools done: %d ok, %d failed", exec_id, state.step, len(ordered) - failed, failed)
+        return False

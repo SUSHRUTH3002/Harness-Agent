@@ -15,7 +15,7 @@
 | 10 | Compaction | **Done** (80% trigger, rolling evidence-preserving summary, each region archived to the `ArtifactStore`, real-usage measurement, compact-and-retry on provider overflow) | Yes (long RCA/debugging sessions) |
 | 11 | Subagents | Not started | Evaluate |
 | 12 | Parallel execution | **Done** (`ParallelToolExecutor`: concurrency-safe calls run together in a sliding pool, unsafe calls are barriers, policy and results in model order, per-call failure isolation, optional cross-run cap) | Yes (RCA pulls from many sources at once) |
-| 12b | Human-in-the-loop (HITL) | **Planned** (added 2026-11-06; plan after Phase 12) | Yes: approve / edit / reject tool calls, forms with options, free-text answers, notes |
+| 12b | Human-in-the-loop (HITL) | **Done** (suspend-and-resume: the run ends `AWAITING_INPUT` with everything in serializable state, resumes with answers even after a restart; approve / edit / reject via `before_tool` `ask`, `ask_user` forms with options or free text, notes on every answer) | Yes |
 | 13 | MCP | Not started | Evaluate |
 | 14 | Safety & governance | Not started | Evaluate |
 | 15 | Replay | Not started | Evaluate after 9 |
