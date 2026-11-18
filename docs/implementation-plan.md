@@ -166,7 +166,7 @@ Status: Phase 0 proposal. Each phase ends with a **validation gate**: unit tests
 - **Two levels of observers:** `Runtime(events=EventBus())` sees every run; `runtime.run(..., observers=[...])` sees one run (one chat's UI).
 - **Delivery:** in `seq` order (a per-run lock keeps concurrent parallel-tool emits ordered), awaited per observer with `observer_timeout` (default 5s); exceptions/timeouts logged and swallowed. An observer emitting from inside `on_event` is delivered directly (no deadlock).
 - **Emitted:** `run.started|completed`, `step.started|completed` (`outcome`: tool_calls / final_answer / truncated / continued_by_hook), `context.built`, `llm.started|completed|failed|retrying|truncated`, `tool.started` (when the body actually starts) / `tool.completed` (after `after_tool`, model order, `ran=false` for calls rejected in `_prepare`), `tools.parallel_group`, `tool.result_offloaded`, `compaction.started|completed|skipped|failed`, `guard.repeated_call`.
-- **Reserved for later phases:** `interaction.*` (12b, now built), `llm.delta` (8, `transient=True`), `checkpoint.saved` (9), `subagent.*` (11, with `parent_execution_id`).
+- **Reserved for later phases:** `interaction.*` (12b, now built), `llm.delta` (8, `transient=True`), `checkpoint.saved` (9, now built), `subagent.*` (11, with `parent_execution_id`).
 - **Deviations from the plan:** names simplified (`run.*`/`step.*` instead of `runtime.*`/`agent.*`/`agent.step.*`); `error.occurred` folded into `run.completed.error` and `llm.failed`; `context.created` is `context.built`. Log lines are unchanged; events are additive. No tests (per the standing instruction); verified with a scratchpad script and a real Gemini run.
 - **main.py:** `HARNESS_EVENTS_FILE` (JSONL) and `HARNESS_PRINT_EVENTS`.
 
@@ -218,6 +218,26 @@ Status: Phase 0 proposal. Each phase ends with a **validation gate**: unit tests
 - `InMemoryStore` and `JsonlFileStore`.
 - A `PersistenceObserver` that checkpoints at `agent.step.completed` and at completion.
 - A **store contract test suite** that every implementation must pass (TF pattern).
+
+### Phase 9 outcome
+
+Decisions taken at the review gate (2026-11-17): the chat id **is** `AgentState.execution_id`; a crashed run is recovered after its lease expires, closing its open tool calls as interrupted rather than re-running them; the database is **PostgreSQL** (not SQLite); a failed final save is **returned** on the result (`persistence_error`), not raised.
+
+- **`persistence.py`**: the `PersistenceStore` protocol and what a chat UI reads: `ChatRecord` (owner, title, status, metadata, counts, tokens, version, fork origin, timestamps, archive/delete, lease), `ChatPage` (opaque cursor), `StoredMessage`, `RunRecord`, `Lease`. Plus `fork_state` / `fork_chat` (edit a message or regenerate an answer = a new chat from a prefix ending before a user message) and `RunPersistence`, which the runtime uses during a run.
+- **When the runtime saves** (`Runtime(store=..., lease_seconds=...)`, then `run(..., chat_id=, owner_id=, metadata=)` / `resume(..., chat_id=)`):
+  - after preparing the run, before the model is called (the person's message is never lost),
+  - after every step that leads to another (`LoopDependencies.checkpoint`, called by the loop),
+  - at the end whatever the status (completed, awaiting_input, failed, cancelled, timed_out, max_steps), releasing the lease.
+  Events are buffered by `RunPersistence` (an observer) and written in the same transaction as the state.
+- **Deviation from the plan: the runtime saves, not a `PersistenceObserver`.** Observers are best-effort (timeouts and failures are swallowed), which suits events but not "the answer was saved". Mid-run checkpoint failures are logged and the run carries on; a lost lease stops the run; a failed final save is returned as `RunResult.persistence_error`.
+- **One run per chat**: `acquire` takes a lease (token + expiry), renewed every third of `lease_seconds` by a heartbeat. A second request is refused with `PersistenceConflictError` before anything runs (double-clicked Approve runs the tool once). Every save checks the lease token. A state older than the store (fewer or different messages) is refused instead of overwriting newer ones.
+- **Crash recovery**: a chat stored as `running` whose lease expired is recovered by the next run: `_repair_transcript` closes open tool calls with `RUN_INTERRUPTED` ("its outcome is unknown; it was not retried"), held results keep their real values, `RunRecord.recovered` is set.
+- **Storage layout**: messages are append-only, so each save inserts only the new ones; the rest of the state is one snapshot (`state` JSONB, without messages). Load = snapshot + messages in order.
+- **`PostgresStore`** (`stores/postgres.py`, asyncpg, optional extra `agent-harness[postgres]`): tables `harness_chats`, `harness_messages`, `harness_runs`, `harness_events` (+ `harness_schema_migrations`), configurable schema and prefix, versioned migrations applied on first use under an advisory lock, indexes for "an owner's chats, newest first", status, metadata (GIN) and forks. Lease expiry uses the database clock, so several app servers can share it.
+- **`InMemoryStore`** (`stores/memory.py`): the reference implementation, copies in and out like a database.
+- **Errors**: `PersistenceError` / `PersistenceConflictError`, codes `PERSISTENCE_ERROR`, `PERSISTENCE_CONFLICT`, `RUN_INTERRUPTED`. Event `checkpoint.saved` (transient).
+- **CLI** (`main.py`): `HARNESS_DATABASE_URL`, `HARNESS_DB_SCHEMA`, `HARNESS_LEASE_SECONDS`, `HARNESS_OWNER_ID`; `--owner`, `--chat`, `--list`, `--show`, `--resume <chat id>`. Without a database the session file is now rewritten after every run (it used to keep the suspended state after the run had completed).
+- **No tests written** (explicit instruction, which replaces the planned contract suite); verified with a scratch script running the same scenarios against both stores (a throwaway PostgreSQL 14): save/load round trip, continue by id, ask → answer → reload shows completed, concurrent request refused, double approve runs once, heartbeat keeps a long run's lease, crash mid-tool recovered without re-running, failed final save returned, list/paginate/filter/rename/archive/delete, message paging, fork, stale state refused, migrations idempotent. Real Gemini runs through the CLI: question answered, `--resume` of the finished chat shows it completed with its answer, `--list`, `--chat` continue, `--show`.
 
 ## Phase 10: Compaction
 

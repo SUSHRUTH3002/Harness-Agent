@@ -1,0 +1,49 @@
+# PostgreSQL for the agent harness chats (Phase 9).
+#
+#   docker compose up -d --build      # start Postgres and create the harness tables
+#   docker compose logs create-tables # shows what was applied
+#   docker compose down               # stop; data is kept in the harness-pgdata volume
+#
+# Then put this in .env:
+#   HARNESS_DATABASE_URL=postgresql://harness:harness@localhost:5433/agent_harness
+#
+# Values can be overridden in a .env file next to this file or in the shell.
+
+name: harness-agent
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: harness-postgres
+    environment:
+      POSTGRES_DB: ${HARNESS_PG_DB:-agent_harness}
+      POSTGRES_USER: ${HARNESS_PG_USER:-harness}
+      POSTGRES_PASSWORD: ${HARNESS_PG_PASSWORD:-harness}
+    ports:
+      # Host port 5433 avoids clashing with a local Postgres on 5432 (e.g. the MIT DB_* one).
+      - "${HARNESS_PG_PORT:-5433}:5432"
+    volumes:
+      - harness-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+    restart: unless-stopped
+
+  # One-shot: applies the harness schema (the same MIGRATIONS the app uses), then exits.
+  # Safe to run again: already-applied versions are skipped.
+  create-tables:
+    build:
+      context: .
+      dockerfile: docker/migrate/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      HARNESS_DATABASE_URL: postgresql://${HARNESS_PG_USER:-harness}:${HARNESS_PG_PASSWORD:-harness}@postgres:5432/${HARNESS_PG_DB:-agent_harness}
+      HARNESS_DB_SCHEMA: ${HARNESS_DB_SCHEMA:-public}
+    restart: "no"
+
+volumes:
+  harness-pgdata:

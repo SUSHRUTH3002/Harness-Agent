@@ -11,6 +11,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
+from typing import Awaitable, Callable
 
 from agent_harness.agent import Agent
 from agent_harness.cancellation import CancellationToken
@@ -50,6 +51,7 @@ class LoopDependencies:
     hooks: Hooks = field(default_factory=Hooks)
     result_processor: LargeResultProcessor | None = None
     compactor: Compactor | None = None
+    checkpoint: Callable[[AgentState], Awaitable[None]] | None = None
 
 
 def _tool_call_signature(calls: list[ToolCall]) -> frozenset[str]:
@@ -137,7 +139,7 @@ class AgentLoop:
                     "continuation": state.consecutive_truncations, "limit": agent.limits.max_truncation_continuations,
                     "dropped_tool_call": bool(calls), "gave_up": not continuing,
                 })
-                await emit_event(EventType.STEP_COMPLETED, {"outcome": "truncated"})
+                await self._end_step(state, deps, {"outcome": "truncated"}, last=not continuing)
                 if continuing:
                     continue
                 return state
@@ -152,24 +154,30 @@ class AgentLoop:
                     state.append(Message.user(
                         stop_decision.message or "Continue.", metadata={"source": "harness", "reason": "before_stop_hook"}
                     ))
-                    await emit_event(EventType.STEP_COMPLETED, {"outcome": "continued_by_hook"})
+                    await self._end_step(state, deps, {"outcome": "continued_by_hook"}, last=False)
                     continue
                 state.result = state.partial_output + response.message.text
                 state.partial_output = ""
                 state.status = RunStatus.COMPLETED
                 logger.info("exec=%s step=%d final answer produced (%d chars)", exec_id, state.step,
                             len(state.result))
-                await emit_event(EventType.STEP_COMPLETED, {"outcome": "final_answer"})
+                await self._end_step(state, deps, {"outcome": "final_answer"}, last=True)
                 return state
 
             state.partial_output = ""
             if await self._execute_tools(calls, state, deps, agent):
-                await emit_event(EventType.STEP_COMPLETED, {"outcome": "awaiting_input", "tool_calls": len(calls)})
+                await self._end_step(state, deps, {"outcome": "awaiting_input", "tool_calls": len(calls)}, last=True)
                 return state
             stopped = await self._check_repeated_calls(agent, state, calls)
-            await emit_event(EventType.STEP_COMPLETED, {"outcome": "tool_calls", "tool_calls": len(calls)})
+            await self._end_step(state, deps, {"outcome": "tool_calls", "tool_calls": len(calls)}, last=stopped)
             if stopped:
                 return state
+
+    async def _end_step(self, state: AgentState, deps: LoopDependencies, data: dict, *, last: bool) -> None:
+        """Report the step, and save progress if another step follows (the runtime saves the last one)."""
+        await emit_event(EventType.STEP_COMPLETED, data)
+        if not last and deps.checkpoint is not None:
+            await deps.checkpoint(state)
 
     async def _generate_with_overflow_retry(
         self, agent: Agent, state: AgentState, deps: LoopDependencies, request: LLMRequest

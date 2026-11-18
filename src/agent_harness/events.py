@@ -66,6 +66,7 @@ class EventType:
     TOOL_DEFERRED = "tool.deferred"
     INTERACTION_REQUESTED = "interaction.requested"
     INTERACTION_RESOLVED = "interaction.resolved"
+    CHECKPOINT_SAVED = "checkpoint.saved"
 
 
 class Event(BaseModel):

@@ -4,6 +4,15 @@
     python main.py                                                # interactive chat
     python main.py -q "..."                                       # answer only, no transcript
 
+With HARNESS_DATABASE_URL set, every chat is saved in PostgreSQL:
+
+    python main.py --owner INC-1001 "Why is db-3 slow?"   # new chat, owned by an incident (or a user id)
+    python main.py --list --owner INC-1001                 # that owner's chats, newest first
+    python main.py --chat <id> "and the replica?"          # continue a chat
+    python main.py --chat <id>                             # reopen it interactively
+    python main.py --show <id>                             # print its conversation
+    python main.py --resume <id>                           # answer what it is waiting for
+
 Configuration lives in .env (see .env.example): HARNESS_MODEL plus the key
 for that provider, e.g. ANTHROPIC_API_KEY or OPENAI_API_KEY.
 """
@@ -29,6 +38,7 @@ from agent_harness import (
     Compactor,
     EventBus,
     FileArtifactStore,
+    HarnessError,
     Hooks,
     Interaction,
     JsonlEventWriter,
@@ -52,6 +62,7 @@ from agent_harness import (
     reject,
 )
 from agent_harness import pending_interactions as pending_interactions_of
+from agent_harness.messages import Message, new_id
 from agent_harness.providers.litellm_provider import LiteLLMProvider
 from agent_harness.providers.local_provider import LocalProvider
 from agent_harness.testing import calculator, get_weather, web_search
@@ -230,6 +241,11 @@ def load_config() -> dict:
         "ask_user": _bool("HARNESS_ASK_USER", True),
         "approval_tools": frozenset(t.strip() for t in (_env("HARNESS_APPROVAL_TOOLS") or "").split(",") if t.strip()),
         "sessions_dir": _env("HARNESS_SESSIONS_DIR") or str(ROOT / ".sessions"),
+        # Phase 9: persistence
+        "database_url": _env("HARNESS_DATABASE_URL"),
+        "db_schema": _env("HARNESS_DB_SCHEMA") or "public",
+        "lease_seconds": _number("HARNESS_LEASE_SECONDS", float, 600.0),
+        "owner_id": _env("HARNESS_OWNER_ID"),
         # Phase 5: events
         "events_file": _env("HARNESS_EVENTS_FILE"),
         "print_events": _bool("HARNESS_PRINT_EVENTS"),
@@ -316,8 +332,15 @@ def build(config: dict) -> tuple[Runtime, Agent]:
         events.subscribe(JsonlEventWriter(config["events_file"]))
     if config["print_events"]:
         events.subscribe(PrintObserver())
+    # Phase 9: with a database, every run loads and saves its chat there. Without one, runs that wait
+    # for input are kept in session files instead (HARNESS_SESSIONS_DIR).
+    store = None
+    if config["database_url"]:
+        from agent_harness.stores.postgres import PostgresStore  # needs asyncpg, so only when configured
+
+        store = PostgresStore(config["database_url"], schema=config["db_schema"])
     runtime = Runtime(provider, hooks=hooks, tool_executor=executor, result_processor=result_processor,
-                      compactor=compactor, events=events)
+                      compactor=compactor, events=events, store=store, lease_seconds=config["lease_seconds"])
     return runtime, agent
 
 
@@ -340,14 +363,43 @@ def print_summary(result: RunResult) -> None:
     )
 
 
+def print_history(messages: list[Message]) -> None:
+    """A saved conversation, the way a chat window shows it."""
+    for message in messages:
+        if message.role is Role.USER:
+            print(f"\nyou> {message.text}")
+        elif message.role is Role.ASSISTANT:
+            for c in message.tool_calls:
+                args = json.dumps(c.arguments) if c.arguments is not None else c.raw_arguments
+                print(f"  [call -> {c.name}] {args}")
+            if message.text:
+                print(f"\n{message.text}")
+        elif message.role is Role.TOOL:
+            tag = f"tool:{message.name}" + (" (error)" if message.is_error else "")
+            print(f"  [{tag}] {message.text[:300]}")
+
+
 async def run_turn(
     runtime: Runtime, agent: Agent, question: str | None, state: AgentState | None, quiet: bool,
-    sessions_dir: Path, answers: list[Answer] | None = None,
+    sessions_dir: Path, answers: list[Answer] | None = None, *, chat_id: str | None = None,
+    owner_id: str | None = None, session_path: Path | None = None,
 ) -> RunResult:
-    """Run (or resume) until the run finishes or the person chooses to answer later."""
+    """Run (or resume) until the run finishes or the person chooses to answer later.
+
+    With a database the runtime saves the chat after every run by itself (`chat_id`). Without one,
+    a run that ever waited for input is kept in a session file, rewritten after every run so it
+    never shows an old question once the run has moved on.
+    """
+    store = runtime.store
     while True:
-        start = len(state.messages) + (1 if question else 0) if state else 1  # skip the user's own message
-        execution = runtime.start(agent, question, state=state, answers=answers or ())
+        if store is not None:
+            record = await store.get_chat(chat_id)
+            before = record.message_count if record else 0
+            execution = runtime.start(agent, question, chat_id=chat_id, owner_id=owner_id, answers=answers or ())
+        else:
+            before = len(state.messages) if state else 0
+            execution = runtime.start(agent, question, state=state, answers=answers or ())
+        start = before + (1 if question else 0)  # skip the user's own message
         try:
             result = await execution.wait()
         except KeyboardInterrupt:
@@ -358,26 +410,32 @@ async def run_turn(
             print_transcript(result, start)
         if result.error:
             print(f"error [{result.error.code}]: {result.error.message}", file=sys.stderr)
+        if result.persistence_error:
+            print(f"warning: the chat could not be saved [{result.persistence_error.code}]: "
+                  f"{result.persistence_error.message}", file=sys.stderr)
         if result.output:
             print(f"\n{result.output}\n")
         if not quiet:
             print_summary(result)
+        if store is None and (session_path is not None or result.awaiting_input):
+            session_path = save_session(result.state, sessions_dir, session_path)
         if not result.awaiting_input:
             return result
 
-        # Suspended: nothing is kept in memory. Save the state, collect answers, and resume from
-        # the saved file -- exactly what a server does across requests (or a restart).
-        path = save_session(result.state, sessions_dir)
+        # Suspended: nothing is kept in memory. Collect answers and resume from what was saved --
+        # exactly what a server does across requests (or a restart).
         answers = collect_answers(result.pending_interactions)
         if answers is None:
-            print(f"\n(saved; resume any time with: python main.py --resume {path})\n")
+            where = chat_id if store is not None else session_path
+            print(f"\n(saved; resume any time with: python main.py --resume {where})\n")
             return result
-        state, question = load_session(path), None
+        question = None
+        state = None if store is not None else load_session(session_path)
 
 
-def save_session(state: AgentState, sessions_dir: Path) -> Path:
-    sessions_dir.mkdir(parents=True, exist_ok=True)
-    path = sessions_dir / f"{state.execution_id}.json"
+def save_session(state: AgentState, sessions_dir: Path, path: Path | None = None) -> Path:
+    path = path or sessions_dir / f"{state.execution_id}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(state.model_dump_json(indent=2), encoding="utf-8")
     return path
 
@@ -455,7 +513,19 @@ def _prompt(text: str) -> str:
         return "later"
 
 
-async def chat(runtime: Runtime, agent: Agent, model: str, quiet: bool, sessions_dir: Path) -> None:
+async def chat(
+    runtime: Runtime, agent: Agent, model: str, quiet: bool, sessions_dir: Path, *,
+    chat_id: str | None = None, owner_id: str | None = None,
+) -> None:
+    store = runtime.store
+    if store is not None:
+        chat_id = chat_id or new_id()
+        saved = await store.load_state(chat_id)
+        if saved is not None:
+            record = await store.get_chat(chat_id)
+            print(f"chat {chat_id}: {record.title or ''} ({record.status.value})")
+            print_history(saved.messages)
+            print()
     print(f"agent-harness chat — model {model}. Type 'exit' or Ctrl-D to quit, '/reset' to start over.\n")
     state: AgentState | None = None
     while True:
@@ -463,19 +533,28 @@ async def chat(runtime: Runtime, agent: Agent, model: str, quiet: bool, sessions
             question = input("you> ").strip()
         except (EOFError, KeyboardInterrupt):
             print()
-            return
+            break
         if not question:
             continue
         if question in ("exit", "quit"):
-            return
+            break
         if question == "/reset":
             state = None
-            print("(conversation cleared)\n")
+            if store is not None:
+                chat_id = new_id()
+            print("(new conversation)\n")
             continue
-        result = await run_turn(runtime, agent, question, state, quiet, sessions_dir)
-        # Keep history across turns unless the run left unanswered tool calls behind
-        # (a run left waiting for input is saved to a file; resume it with --resume).
+        try:
+            result = await run_turn(runtime, agent, question, state, quiet, sessions_dir, chat_id=chat_id,
+                                    owner_id=owner_id)
+        except HarnessError as exc:
+            print(f"error [{exc.code}]: {exc.message}\n", file=sys.stderr)
+            continue
+        # Without a database, keep history across turns unless the run left unanswered tool calls
+        # behind (a run left waiting for input is saved to a file; resume it with --resume).
         state = None if result.state.pending_tool_calls() else result.state
+    if store is not None and await store.get_chat(chat_id) is not None:
+        print(f"(chat saved; reopen it with: python main.py --chat {chat_id})")
 
 
 async def main() -> int:
@@ -483,7 +562,14 @@ async def main() -> int:
     parser.add_argument("question", nargs="*", help="question to ask; omit for interactive chat")
     parser.add_argument("-q", "--quiet", action="store_true", help="print only the answer (logs: warnings only)")
     parser.add_argument("-v", "--verbose", action="store_true", help="debug logging (overrides HARNESS_LOG_LEVEL)")
-    parser.add_argument("--resume", metavar="FILE", help="resume a run saved while waiting for your input")
+    parser.add_argument("--resume", metavar="CHAT_OR_FILE",
+                        help="answer a run that is waiting for your input: a chat id (with a database) or a session file")
+    parser.add_argument("--chat", metavar="ID", help="continue (or create) this chat (needs HARNESS_DATABASE_URL)")
+    parser.add_argument("--owner", metavar="KEY",
+                        help="owner of new chats and filter for --list: a user id, an incident number, ... "
+                             "(default HARNESS_OWNER_ID)")
+    parser.add_argument("--list", action="store_true", help="list saved chats (needs HARNESS_DATABASE_URL)")
+    parser.add_argument("--show", metavar="ID", help="print a saved chat (needs HARNESS_DATABASE_URL)")
     args = parser.parse_args()
 
     try:
@@ -508,26 +594,82 @@ async def main() -> int:
         config["parallel_tools"], config["max_parallel_tools"], config["events_file"] or "none",
         config["print_events"], config["ask_user"], ",".join(sorted(config["approval_tools"])) or "none",
     )
+    logger.info("persistence: %s (schema=%s lease=%.0fs owner=%s)",
+                "postgres" if config["database_url"] else f"session files in {config['sessions_dir']}",
+                config["db_schema"], config["lease_seconds"], args.owner or config["owner_id"] or "none")
     if config["compaction"] and not config["max_context_tokens"]:
         logger.warning("HARNESS_COMPACTION is on but HARNESS_MAX_CONTEXT_TOKENS is blank: compaction will only "
                        "run if the provider rejects a request as too long")
     runtime, agent = build(config)
+    try:
+        return await run_cli(args, runtime, agent, config)
+    except HarnessError as exc:
+        print(f"error [{exc.code}]: {exc.message}", file=sys.stderr)
+        return 2
+    finally:
+        if runtime.store is not None:
+            await runtime.store.close()
 
+
+async def run_cli(args: argparse.Namespace, runtime: Runtime, agent: Agent, config: dict) -> int:
+    store = runtime.store
     sessions_dir = Path(config["sessions_dir"])
-    if args.resume:
-        state = load_session(Path(args.resume))
-        if state.status is not RunStatus.AWAITING_INPUT:
-            print(f"{args.resume}: run is '{state.status.value}', not waiting for input", file=sys.stderr)
+    owner = args.owner or config["owner_id"]
+    if store is None and (args.chat or args.list or args.show):
+        print("--chat, --list and --show need a database: set HARNESS_DATABASE_URL in .env", file=sys.stderr)
+        return 2
+
+    if args.list:
+        page = await store.list_chats(owner_id=owner, limit=50)
+        if not page.items:
+            print("no chats" + (f" for owner {owner}" if owner else ""))
+        for c in page.items:
+            status = "interrupted" if c.interrupted else "running" if c.running else c.status.value
+            print(f"{c.id}  {status:<14} {c.updated_at:%Y-%m-%d %H:%M}  {c.message_count:>3} msgs  "
+                  f"{c.owner_id or '-':<12} {c.title or ''}")
+        return 0
+
+    if args.show:
+        record, state = await store.get_chat(args.show), await store.load_state(args.show)
+        if record is None or state is None:
+            print(f"no chat {args.show}", file=sys.stderr)
             return 2
+        print(f"chat {record.id}: {record.title or ''}\n  owner={record.owner_id or '-'} status={record.status.value} "
+              f"messages={record.message_count} updated={record.updated_at:%Y-%m-%d %H:%M}")
+        print_history(state.messages)
+        if record.status is RunStatus.AWAITING_INPUT:
+            print(f"\n⏸  waiting for your input; answer with: python main.py --resume {record.id}")
+        return 0
+
+    if args.resume:
+        # A chat id with a database, a session file without one.
+        state = await store.load_state(args.resume) if store is not None else load_session(Path(args.resume))
+        if state is None:
+            print(f"no chat {args.resume}", file=sys.stderr)
+            return 2
+        if state.status is not RunStatus.AWAITING_INPUT:
+            print(f"{args.resume}: the run is '{state.status.value}', not waiting for input")
+            if state.result:
+                print(f"\nits last answer:\n\n{state.result}\n")
+            return 0 if state.status is RunStatus.COMPLETED else 2
         answers = collect_answers(pending_interactions_of(state))
         if answers is None:
             return 0
-        result = await run_turn(runtime, agent, None, state, args.quiet, sessions_dir, answers)
+        if store is not None:
+            result = await run_turn(runtime, agent, None, None, args.quiet, sessions_dir, answers, chat_id=args.resume)
+        else:
+            result = await run_turn(runtime, agent, None, state, args.quiet, sessions_dir, answers,
+                                    session_path=Path(args.resume))
         return 0 if result.ok or result.awaiting_input else 1
+
+    chat_id = args.chat or (new_id() if store is not None else None)
     if args.question:
-        result = await run_turn(runtime, agent, " ".join(args.question), None, args.quiet, sessions_dir)
+        result = await run_turn(runtime, agent, " ".join(args.question), None, args.quiet, sessions_dir,
+                                chat_id=chat_id, owner_id=owner)
+        if store is not None and not args.quiet:
+            print(f"  (chat {chat_id}; continue it with: python main.py --chat {chat_id} \"...\")")
         return 0 if result.ok or result.awaiting_input else 1
-    await chat(runtime, agent, config["model"], args.quiet, sessions_dir)
+    await chat(runtime, agent, config["model"], args.quiet, sessions_dir, chat_id=chat_id, owner_id=owner)
     return 0
 
 

@@ -24,6 +24,8 @@ from agent_harness.errors import (
     HarnessError,
     HarnessTimeoutError,
     LLMError,
+    PersistenceConflictError,
+    PersistenceError,
     ToolError,
     ValidationError,
 )
@@ -58,11 +60,22 @@ from agent_harness.hooks import Hooks, StepDecision, StopDecision, ToolDecision,
 from agent_harness.llm import FinishReason, LLMProvider, LLMRequest, LLMResponse, ToolSchema, Usage
 from agent_harness.loop import AgentLoop, LoopDependencies
 from agent_harness.messages import Message, Role, TextPart, ToolCall, ToolCallPart
+from agent_harness.persistence import (
+    ChatPage,
+    ChatRecord,
+    Lease,
+    PersistenceStore,
+    RunRecord,
+    StoredMessage,
+    fork_chat,
+    fork_state,
+)
 from agent_harness.registry import ToolRegistry
 from agent_harness.results import ArtifactStore, FileArtifactStore, InMemoryArtifactStore, LargeResultProcessor, make_read_artifact_tool
 from agent_harness.retry import RetryPolicy, ResilientLLMProvider
 from agent_harness.runtime import Execution, RunResult, Runtime
 from agent_harness.state import AgentState, RunStatus
+from agent_harness.stores.memory import InMemoryStore
 from agent_harness.tools import FunctionTool, Tool, ToolAnnotations, ToolContext, ToolResult, tool
 
 __all__ = [
@@ -74,6 +87,8 @@ __all__ = [
     "ArtifactStore",
     "CancellationToken",
     "CharTokenCounter",
+    "ChatPage",
+    "ChatRecord",
     "Compactor",
     "ContextError",
     "ContextManager",
@@ -92,6 +107,7 @@ __all__ = [
     "HarnessTimeoutError",
     "Hooks",
     "InMemoryArtifactStore",
+    "InMemoryStore",
     "InputRequired",
     "Interaction",
     "InteractionOption",
@@ -101,24 +117,31 @@ __all__ = [
     "LLMRequest",
     "LLMResponse",
     "LargeResultProcessor",
+    "Lease",
     "LoopDependencies",
     "Message",
     "Observer",
     "ParallelToolExecutor",
+    "PersistenceConflictError",
+    "PersistenceError",
+    "PersistenceStore",
     "PrintObserver",
     "PromptSection",
     "ResilientLLMProvider",
     "RetryPolicy",
-    "RunEmitter",
     "Role",
+    "RunEmitter",
+    "RunRecord",
     "RunResult",
     "RunStatus",
     "Runtime",
     "SequentialToolExecutor",
     "StepDecision",
     "StopDecision",
+    "StoredMessage",
     "Subscription",
     "TextPart",
+    "TokenCounter",
     "Tool",
     "ToolAnnotations",
     "ToolCall",
@@ -131,7 +154,6 @@ __all__ = [
     "ToolRegistry",
     "ToolResult",
     "ToolSchema",
-    "TokenCounter",
     "Usage",
     "ValidationError",
     "allow",
@@ -143,6 +165,8 @@ __all__ = [
     "deny",
     "edit",
     "emit_event",
+    "fork_chat",
+    "fork_state",
     "make_ask_user_tool",
     "make_read_artifact_tool",
     "pending_interactions",

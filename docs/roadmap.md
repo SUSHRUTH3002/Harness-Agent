@@ -11,7 +11,7 @@
 | 6 | Observability | Not started | Yes |
 | 7 | Large result handling | **Done** (offload oversized/combined results to an `ArtifactStore` + `read_artifact`; no "summarize" strategy, see outcome notes) | Likely |
 | 8 | Streaming | Not started | Likely |
-| 9 | Persistence | Not started | Likely |
+| 9 | Persistence | **Done** (`PersistenceStore` with `InMemoryStore` and `PostgresStore`; the runtime saves at start, after each continuing step and at the end whatever the status; chats load by id and list by owner (user, incident, ...); a lease allows one run per chat and recovers crashed runs without re-running their tool calls; fork for edit/regenerate) | Yes |
 | 10 | Compaction | **Done** (80% trigger, rolling evidence-preserving summary, each region archived to the `ArtifactStore`, real-usage measurement, compact-and-retry on provider overflow) | Yes (long RCA/debugging sessions) |
 | 11 | Subagents | Not started | Evaluate |
 | 12 | Parallel execution | **Done** (`ParallelToolExecutor`: concurrency-safe calls run together in a sliding pool, unsafe calls are barriers, policy and results in model order, per-call failure isolation, optional cross-run cap) | Yes (RCA pulls from many sources at once) |

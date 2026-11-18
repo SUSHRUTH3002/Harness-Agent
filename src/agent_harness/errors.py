@@ -44,6 +44,10 @@ class ErrorCode(StrEnum):
     AWAITING_INPUT = "AWAITING_INPUT"
     TOOL_REJECTED = "TOOL_REJECTED"
     STOPPED_BY_HOOK = "STOPPED_BY_HOOK"
+    # Persistence (persistence.py)
+    PERSISTENCE_ERROR = "PERSISTENCE_ERROR"
+    PERSISTENCE_CONFLICT = "PERSISTENCE_CONFLICT"
+    RUN_INTERRUPTED = "RUN_INTERRUPTED"
 
 
 class ErrorInfo(BaseModel):
@@ -113,3 +117,15 @@ class ExecutionError(HarnessError):
 
 class ContextError(HarnessError):
     default_code = ErrorCode.CONTEXT_OVERFLOW
+
+
+class PersistenceError(HarnessError):
+    """A store could not load or save (database down, history diverged, ...)."""
+
+    default_code = ErrorCode.PERSISTENCE_ERROR
+
+
+class PersistenceConflictError(PersistenceError):
+    """Someone else is working on the chat, or the state is older than what is stored."""
+
+    default_code = ErrorCode.PERSISTENCE_CONFLICT

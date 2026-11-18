@@ -10,9 +10,10 @@ input.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Sequence
 
 from pydantic import BaseModel
 
@@ -27,7 +28,14 @@ from agent_harness.hitl import Answer, Interaction, pending_interactions, submit
 from agent_harness.hooks import Hooks
 from agent_harness.llm import LLMProvider, Usage
 from agent_harness.loop import AgentLoop, LoopDependencies
-from agent_harness.messages import Message, short_id, utcnow
+from agent_harness.messages import Message, new_id, short_id, utcnow
+from agent_harness.persistence import (
+    DEFAULT_LEASE_SECONDS,
+    PersistenceStore,
+    RunPersistence,
+    RunRecord,
+    check_history,
+)
 from agent_harness.registry import ToolRegistry
 from agent_harness.results import LargeResultProcessor
 from agent_harness.state import AgentState, RunStatus
@@ -48,6 +56,7 @@ class RunResult(BaseModel):
     steps: int
     duration: float
     state: AgentState
+    persistence_error: ErrorInfo | None = None # Set when the final state could not be saved to the persistence store.
 
     @property
     def ok(self) -> bool:
@@ -79,6 +88,24 @@ def _repair_transcript(state: AgentState, code: str, message: str) -> None:
         result = held.get(call.id) or ToolResult.error(call.id, call.name, message, code)
         state.append(Message.tool(result.call_id, result.content, name=result.name, is_error=result.is_error))
         state.tool_results.append(result)
+
+
+def _recover_interrupted(state: AgentState) -> None:
+    """The previous run on this chat stopped without saving its end (its process died).
+
+    Tool calls it left open are closed as interrupted, not re-run: they may already have had
+    effects (an email sent, a pod restarted) that running them again would repeat.
+    """
+    logger.warning("exec=%s recovering a run that stopped without finishing (step %d, %d open tool call(s))",
+                   short_id(state.execution_id), state.step, len(state.pending_tool_calls()))
+    _repair_transcript(
+        state, ErrorCode.RUN_INTERRUPTED,
+        "This tool call was interrupted: the process running it stopped before it finished, so its outcome is "
+        "unknown. It was not retried.",
+    )
+    state.status = RunStatus.FAILED
+    state.error = ErrorInfo(code=ErrorCode.RUN_INTERRUPTED, type="Interrupted",
+                            message="The previous run stopped without finishing (its process ended).")
 
 
 class Execution:
@@ -123,6 +150,8 @@ class Runtime:
         result_processor: LargeResultProcessor | None = None,
         compactor: Compactor | None = None,
         events: EventBus | None = None,
+        store: PersistenceStore | None = None,
+        lease_seconds: float = DEFAULT_LEASE_SECONDS,
     ) -> None:
         if not isinstance(llm, LLMProvider):
             raise TypeError("llm must implement LLMProvider (an async generate(request) method)")
@@ -140,6 +169,11 @@ class Runtime:
         self.compactor = compactor
         # Observers for every run on this runtime (Phase 5). Per-run observers go to start(observers=...).
         self.events = events or EventBus()
+        # None by default: the caller keeps the state. With a store, each run loads its chat from
+        # it and saves as it goes (Phase 9, persistence.py).
+        self.store = store
+        # How long a run holds its chat without renewing (renewed every third of it while alive).
+        self.lease_seconds = lease_seconds
 
     def start(
         self,
@@ -147,6 +181,9 @@ class Runtime:
         input: RunInput | None = None,
         *,
         state: AgentState | None = None,
+        chat_id: str | None = None,
+        owner_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
         observers: Sequence[ObserverLike] = (),
         parent_execution_id: str | None = None,
         answers: Iterable[Answer] = (),
@@ -155,16 +192,14 @@ class Runtime:
 
         `observers` receive this run's events only (on top of `self.events`, which sees every run).
         `answers` respond to a suspended run's pending interactions (see `resume`).
+
+        `chat_id` names the conversation (it is the state's `execution_id`). With a `store`, the
+        chat is loaded from it, or created, and saved as the run goes; pass `chat_id` instead of
+        `state`. `owner_id` (a user id, an incident number, ...) and `metadata` are stored with a
+        new chat, for listing it later. Errors such as "already running" then surface from `wait()`.
         """
-        resumed = state is not None
-        state = self._prepare_state(agent, input, state, list(answers))
-        cancel_token = CancellationToken()
-        emitter = RunEmitter(
-            execution_id=state.execution_id, agent_id=state.agent_id, bus=self.events, observers=observers,
-            state=state, parent_execution_id=parent_execution_id,
-        )
-        task = asyncio.ensure_future(self._execute(agent, state, cancel_token, emitter, resumed=resumed))
-        return Execution(task, cancel_token, state.execution_id)
+        return self._start(agent, input, state=state, chat_id=chat_id, owner_id=owner_id, metadata=metadata,
+                           observers=observers, parent_execution_id=parent_execution_id, answers=list(answers))
 
     async def run(
         self,
@@ -172,27 +207,105 @@ class Runtime:
         input: RunInput | None = None,
         *,
         state: AgentState | None = None,
+        chat_id: str | None = None,
+        owner_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
         observers: Sequence[ObserverLike] = (),
         answers: Iterable[Answer] = (),
     ) -> RunResult:
-        return await self.start(agent, input, state=state, observers=observers, answers=answers).wait()
+        return await self.start(agent, input, state=state, chat_id=chat_id, owner_id=owner_id, metadata=metadata,
+                                observers=observers, answers=answers).wait()
 
     async def resume(
         self,
         agent: Agent,
-        state: AgentState,
-        answers: Iterable[Answer],
+        state: AgentState | None = None,
+        answers: Iterable[Answer] = (),
         *,
+        chat_id: str | None = None,
+        owner_id: str | None = None,
         observers: Sequence[ObserverLike] = (),
     ) -> RunResult:
         """Continue a run that ended AWAITING_INPUT, with the person's answers.
 
-        `state` is usually loaded back from storage: `AgentState.model_validate_json(saved)`.
+        Pass the saved `state` (`AgentState.model_validate_json(saved)`) or, with a store, its `chat_id`.
         Unanswered interactions stay pending (the run suspends again until they are answered).
         """
-        if state.status is not RunStatus.AWAITING_INPUT:
+        if state is None and (chat_id is None or self.store is None):
+            raise ValidationError("resume needs the suspended run's state (or its chat_id, with a store)",
+                                  code=ErrorCode.INVALID_CONFIG)
+        if state is not None and state.status is not RunStatus.AWAITING_INPUT:
             raise ValidationError(f"state is '{state.status.value}', not awaiting input", code=ErrorCode.INVALID_CONFIG)
-        return await self.run(agent, state=state, observers=observers, answers=answers)
+        return await self._start(agent, None, state=state, chat_id=chat_id, owner_id=owner_id, metadata=None,
+                                 observers=observers, parent_execution_id=None, answers=list(answers),
+                                 require_awaiting=True).wait()
+
+    def _start(
+        self, agent: Agent, input: RunInput | None, *, state: AgentState | None, chat_id: str | None,
+        owner_id: str | None, metadata: dict[str, Any] | None, observers: Sequence[ObserverLike],
+        parent_execution_id: str | None, answers: list[Answer], require_awaiting: bool = False,
+    ) -> Execution:
+        if state is not None and chat_id is not None and state.execution_id != chat_id:
+            raise ValidationError(f"state is chat '{state.execution_id}', not '{chat_id}'", code=ErrorCode.INVALID_CONFIG)
+        cancel_token = CancellationToken()
+        if self.store is None:
+            if owner_id is not None or metadata:
+                raise ValidationError("owner_id and metadata are kept by a PersistenceStore; this Runtime has none",
+                                      code=ErrorCode.INVALID_CONFIG)
+            resumed = state is not None
+            state = self._prepare_state(agent, input, state, answers, execution_id=chat_id)
+            emitter = RunEmitter(
+                execution_id=state.execution_id, agent_id=state.agent_id, bus=self.events, observers=observers,
+                state=state, parent_execution_id=parent_execution_id,
+            )
+            task = asyncio.ensure_future(self._execute(agent, state, cancel_token, emitter, resumed=resumed))
+            return Execution(task, cancel_token, state.execution_id)
+
+        self._normalize_input(input)  # report malformed input now rather than from inside the task
+        chat_id = chat_id or (state.execution_id if state is not None else new_id())
+        task = asyncio.ensure_future(self._execute_stored(
+            agent, input, state, chat_id, owner_id, metadata, answers, cancel_token, observers, parent_execution_id,
+            require_awaiting,
+        ))
+        return Execution(task, cancel_token, chat_id)
+
+    async def _execute_stored(
+        self, agent: Agent, input: RunInput | None, given: AgentState | None, chat_id: str, owner_id: str | None,
+        metadata: dict[str, Any] | None, answers: list[Answer], cancel_token: CancellationToken,
+        observers: Sequence[ObserverLike], parent_execution_id: str | None, require_awaiting: bool,
+    ) -> RunResult:
+        """A run on a stored chat: lease it, load it, save the person's message, run, save the end."""
+        store = self.store
+        assert store is not None
+        lease = await store.acquire(chat_id, agent_id=agent.id, owner_id=owner_id, metadata=metadata,
+                                    lease_seconds=self.lease_seconds)
+        try:
+            if given is not None:
+                check_history(lease.message_count, lease.last_message_id, given)  # an older copy would lose messages
+            state = given if given is not None else lease.state
+            if lease.recovered and state is not None:
+                _recover_interrupted(state)
+            if require_awaiting and (state is None or state.status is not RunStatus.AWAITING_INPUT):
+                current = state.status.value if state is not None else "new"
+                raise ValidationError(f"chat '{chat_id}' is '{current}', not awaiting input",
+                                      code=ErrorCode.INVALID_CONFIG)
+            resumed = state is not None
+            first_seq = len(state.messages) if state is not None else 0
+            kind = "new" if state is None else "resume" if answers else "continue"
+            state = self._prepare_state(agent, input, state, answers, execution_id=chat_id)
+            state.status = RunStatus.RUNNING
+            persist = RunPersistence(store, lease, RunRecord(chat_id=chat_id, kind=kind, first_seq=first_seq,
+                                                             recovered=lease.recovered), state)
+            await persist.save(state)  # the person's message is kept even if the model call fails
+        except BaseException:
+            with contextlib.suppress(Exception):
+                await store.release(lease)
+            raise
+        emitter = RunEmitter(
+            execution_id=chat_id, agent_id=state.agent_id, bus=self.events, observers=[*observers, persist],
+            state=state, parent_execution_id=parent_execution_id,
+        )
+        return await self._execute(agent, state, cancel_token, emitter, resumed=resumed, persist=persist)
 
     def run_sync(
         self,
@@ -206,24 +319,32 @@ class Runtime:
 
     async def _execute(
         self, agent: Agent, state: AgentState, cancel_token: CancellationToken, emitter: RunEmitter, *,
-        resumed: bool,
+        resumed: bool, persist: RunPersistence | None = None,
     ) -> RunResult:
         # Everything this task runs (loop, executor, tools, retry wrapper) emits through `emitter`.
         token = bind_emitter(emitter)
         try:
-            return await self._execute_bound(agent, state, cancel_token, emitter, resumed=resumed)
+            if persist is not None:
+                persist.start_heartbeat()
+            result = await self._execute_bound(agent, state, cancel_token, emitter, resumed=resumed, persist=persist)
+            if persist is not None:
+                # Whatever the outcome (completed, awaiting_input, failed, cancelled), the end is saved.
+                result.persistence_error = await persist.finish(state)
+            return result
         finally:
+            if persist is not None:
+                persist.stop_heartbeat()
             unbind_emitter(token)
 
     async def _execute_bound(
         self, agent: Agent, state: AgentState, cancel_token: CancellationToken, emitter: RunEmitter, *,
-        resumed: bool,
+        resumed: bool, persist: RunPersistence | None = None,
     ) -> RunResult:
         registry = ToolRegistry(agent.tools)
         deps = LoopDependencies(
             llm=self.llm, context=self.context_manager, executor=self.tool_executor, registry=registry,
             cancel=cancel_token, hooks=self.hooks, result_processor=self.result_processor,
-            compactor=self.compactor,
+            compactor=self.compactor, checkpoint=persist.checkpoint if persist is not None else None,
         )
         exec_id = short_id(state.execution_id)
         logger.info(
@@ -238,6 +359,7 @@ class Runtime:
             await emitter.emit(EventType.RUN_STARTED, {
                 "agent": agent.id, "model": agent.model, "tools": registry.names(),
                 "history_messages": len(state.messages), "resumed": resumed,
+                **({"run_id": persist.run.id, "recovered": persist.run.recovered} if persist is not None else {}),
             })
             await registry.setup()
             logger.debug("exec=%s tools ready: %s", exec_id, ", ".join(registry.names()) or "none")
@@ -323,7 +445,8 @@ class Runtime:
         return messages
 
     def _prepare_state(
-        self, agent: Agent, input: RunInput | None, state: AgentState | None, answers: list[Answer]
+        self, agent: Agent, input: RunInput | None, state: AgentState | None, answers: list[Answer], *,
+        execution_id: str | None = None,
     ) -> AgentState:
         messages = self._normalize_input(input)
         if state is None:
@@ -331,7 +454,7 @@ class Runtime:
                 raise ValidationError("answers need the suspended run's state", code=ErrorCode.INVALID_CONFIG)
             if not messages:
                 raise ValidationError("input is required to start a new run", code=ErrorCode.INVALID_CONFIG)
-            state = AgentState(agent_id=agent.id)
+            state = AgentState(agent_id=agent.id, **({"execution_id": execution_id} if execution_id else {}))
         else:
             if state.agent_id != agent.id:
                 raise ValidationError(
