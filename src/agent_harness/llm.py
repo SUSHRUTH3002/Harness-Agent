@@ -8,7 +8,7 @@ neutral code on failure.
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, AsyncIterator, Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -68,6 +68,9 @@ class LLMResponse(BaseModel):
     finish_reason: FinishReason = FinishReason.STOP
     usage: Usage = Field(default_factory=Usage)
     model: str | None = None
+    # False when the provider sent no token counts (some stream without them, e.g. many local
+    # servers): `usage` is then zero, not an estimate, and nothing should calibrate from it.
+    usage_reported: bool = True
     raw: Any = Field(default=None, exclude=True)
 
     @model_validator(mode="after")
@@ -80,3 +83,41 @@ class LLMResponse(BaseModel):
 @runtime_checkable
 class LLMProvider(Protocol):
     async def generate(self, request: LLMRequest) -> LLMResponse: ...
+
+
+class LLMStreamEvent(BaseModel):
+    """One piece of a streamed model response, in a provider-neutral form (Phase 8).
+
+    kind:
+      text       `text` is the next piece of the answer.
+      tool_call  a piece of tool call number `index`: `call_id`/`name` when first known, then
+                 `arguments` fragments to append. Arguments are only parsed once complete.
+      usage      token counts for the whole response (usually last; absent if not reported).
+      finish     the model is done: `finish_reason`. `response` is set when the whole response
+                 was already available (a provider that does not stream), and is then used as is.
+      reset      the attempt so far is discarded (a retry started): forget what came before.
+    """
+
+    kind: Literal["text", "tool_call", "usage", "finish", "reset"]
+    text: str = ""
+    index: int = 0
+    call_id: str | None = None
+    name: str | None = None
+    arguments: str = ""
+    usage: Usage | None = None
+    finish_reason: FinishReason | None = None
+    model: str | None = None
+    response: LLMResponse | None = None
+    attempt: int | None = None
+
+
+@runtime_checkable
+class StreamingLLMProvider(LLMProvider, Protocol):
+    """An `LLMProvider` that can also stream (Phase 8). `generate()` stays the non-streaming path.
+
+    `stream()` yields `LLMStreamEvent`s and ends with a `finish` event; it raises `LLMError`
+    (neutral codes, as `generate()` does) if the call fails, including partway through.
+    Closing the iterator early must close the connection to the model.
+    """
+
+    def stream(self, request: LLMRequest) -> AsyncIterator[LLMStreamEvent]: ...

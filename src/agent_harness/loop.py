@@ -27,6 +27,7 @@ from agent_harness.messages import Message, ToolCall, preview, short_id
 from agent_harness.registry import ToolRegistry
 from agent_harness.results import LargeResultProcessor
 from agent_harness.state import AgentState, RunStatus
+from agent_harness.streaming import StreamAssembler, close_iterator, open_stream
 from agent_harness.tools import ToolResult
 
 logger = logging.getLogger(__name__)
@@ -52,6 +53,9 @@ class LoopDependencies:
     result_processor: LargeResultProcessor | None = None
     compactor: Compactor | None = None
     checkpoint: Callable[[AgentState], Awaitable[None]] | None = None
+    # Stream model answers (Phase 8): pieces are announced as transient llm.token events while
+    # the model writes; the assembled response is the same as without streaming.
+    stream: bool = False
 
 
 def _tool_call_signature(calls: list[ToolCall]) -> frozenset[str]:
@@ -127,9 +131,13 @@ class AgentLoop:
             )
             if response.message.text:
                 logger.info("exec=%s step=%d assistant: %s", exec_id, state.step, preview(response.message.text))
+            if not response.usage_reported:
+                logger.debug("exec=%s step=%d the provider reported no token usage for this response", exec_id,
+                             state.step)
             await emit_event(EventType.LLM_COMPLETED, {
                 "finish_reason": response.finish_reason.value, "latency": round(time.perf_counter() - started, 3),
                 "input_tokens": response.usage.input_tokens, "output_tokens": response.usage.output_tokens,
+                "usage_reported": response.usage_reported, "streamed": deps.stream,
                 "tool_calls": [c.name for c in calls], "text": preview(response.message.text, 500),
             })
 
@@ -215,13 +223,14 @@ class AgentLoop:
         """
         await emit_event(EventType.LLM_STARTED, {
             "model": request.model, "messages": len(request.messages), "tools": len(request.tools),
+            "stream": deps.stream,
         })
         try:
             if agent.limits.llm_timeout is None:
-                return await deps.llm.generate(request)
+                return await self._call_llm(deps, request)
             try:
                 async with asyncio.timeout(agent.limits.llm_timeout):
-                    return await deps.llm.generate(request)
+                    return await self._call_llm(deps, request)
             except TimeoutError as exc:
                 raise LLMError(
                     f"LLM call exceeded agent.limits.llm_timeout ({agent.limits.llm_timeout:.0f}s)",
@@ -232,6 +241,38 @@ class AgentLoop:
                 "code": exc.code, "message": exc.message, "attempts": exc.details.get("attempts", 1),
             })
             raise
+
+    async def _call_llm(self, deps: LoopDependencies, request: LLMRequest) -> LLMResponse:
+        """One model call. Streaming: announce each piece as it arrives, then assemble the response.
+
+        A provider that can't stream is called with generate() and its answer announced as one
+        piece, so a watcher handles both the same way. A `reset` piece (the retry wrapper
+        restarting a failed stream) is announced as llm.stream_reset: clear what was shown.
+        """
+        if not deps.stream:
+            return await deps.llm.generate(request)
+        assembler = StreamAssembler()
+        index = 0
+        events = open_stream(deps.llm, request)
+        try:
+            async for event in events:
+                if event.kind == "reset":
+                    await emit_event(EventType.LLM_STREAM_RESET, {
+                        "attempt": event.attempt, "discarded_chars": assembler.text_chars,
+                    }, transient=True)
+                    index = 0
+                named = assembler.add(event)
+                if event.kind == "text" and event.text:
+                    index += 1
+                    await emit_event(EventType.LLM_TOKEN, {"text": event.text, "index": index}, transient=True)
+                elif named is not None:
+                    await emit_event(EventType.LLM_TOOL_CALL_DELTA, {
+                        "call_id": named[0], "name": named[1], "index": event.index,
+                    }, transient=True)
+        finally:
+            # Closes the model connection if this stops early (cancelled, timed out).
+            await close_iterator(events)
+        return assembler.response()
 
     async def _check_repeated_calls(self, agent: Agent, state: AgentState, calls: list[ToolCall]) -> bool:
         """Detect the model issuing the same tool call(s) repeatedly. Returns True if the run stopped.

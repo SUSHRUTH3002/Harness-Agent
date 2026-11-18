@@ -3,6 +3,9 @@
     python main.py "What's the weather in Tokyo in Fahrenheit?"   # one question
     python main.py                                                # interactive chat
     python main.py -q "..."                                       # answer only, no transcript
+    python main.py --no-stream "..."                              # print the answer when it is complete
+
+In a terminal the answer is printed as the model writes it (HARNESS_STREAM=true, the default).
 
 With HARNESS_DATABASE_URL set, every chat is saved in PostgreSQL:
 
@@ -37,6 +40,8 @@ from agent_harness import (
     Answer,
     Compactor,
     EventBus,
+    EventType,
+    Execution,
     FileArtifactStore,
     HarnessError,
     Hooks,
@@ -246,6 +251,9 @@ def load_config() -> dict:
         "db_schema": _env("HARNESS_DB_SCHEMA") or "public",
         "lease_seconds": _number("HARNESS_LEASE_SECONDS", float, 600.0),
         "owner_id": _env("HARNESS_OWNER_ID"),
+        # Phase 8: streaming
+        "stream": _bool("HARNESS_STREAM", True),
+        "stream_idle_timeout": _number("HARNESS_STREAM_IDLE_TIMEOUT", float, 30.0),
         # Phase 5: events
         "events_file": _env("HARNESS_EVENTS_FILE"),
         "print_events": _bool("HARNESS_PRINT_EVENTS"),
@@ -277,7 +285,9 @@ def build(config: dict) -> tuple[Runtime, Agent]:
         )
     
     # Retries live outside the loop entirely, this wrapper is the only thing that changes when retry behavior changes. (refer retry.py)
-    provider = ResilientLLMProvider(provider, policy=RetryPolicy(max_retries=config["max_retries"]))
+    # idle_timeout (Phase 8): a stream that goes quiet that long after it started is retried.
+    provider = ResilientLLMProvider(provider, policy=RetryPolicy(max_retries=config["max_retries"]),
+                                    idle_timeout=config["stream_idle_timeout"])
 
     tools = [calculator, get_weather, web_search, fetch_resource_metadata, fetch_resource_neighbors]
     if config["ask_user"]:
@@ -340,7 +350,8 @@ def build(config: dict) -> tuple[Runtime, Agent]:
 
         store = PostgresStore(config["database_url"], schema=config["db_schema"])
     runtime = Runtime(provider, hooks=hooks, tool_executor=executor, result_processor=result_processor,
-                      compactor=compactor, events=events, store=store, lease_seconds=config["lease_seconds"])
+                      compactor=compactor, events=events, store=store, lease_seconds=config["lease_seconds"],
+                      stream=config["stream"])
     return runtime, agent
 
 
@@ -379,6 +390,34 @@ def print_history(messages: list[Message]) -> None:
             print(f"  [{tag}] {message.text[:300]}")
 
 
+async def print_live(execution: Execution) -> bool:
+    """Show the run as it happens: the model's words as it writes them, and each tool call and
+    result as it finishes. Returns True if any answer text was shown."""
+    shown = False  # text shown for the response being written now
+    any_text = False
+    async for event in execution.events():
+        if event.type == EventType.LLM_TOKEN:
+            if not shown:
+                print()
+            print(event.data["text"], end="", flush=True)
+            shown = any_text = True
+        elif event.type == EventType.LLM_STREAM_RESET:
+            # A terminal can't take back printed text, so say what happened.
+            if shown:
+                print("\n  [connection dropped; retrying. Ignore the partial text above]", flush=True)
+            shown = False
+        elif event.type == EventType.LLM_COMPLETED:
+            if shown:
+                print(flush=True)
+            shown = False
+        elif event.type == EventType.TOOL_STARTED:
+            print(f"  [call -> {event.data['tool']}] {json.dumps(event.data.get('arguments'))}", flush=True)
+        elif event.type == EventType.TOOL_COMPLETED:
+            tag = f"tool:{event.data['tool']}" + ("" if event.data["ok"] else " (error)")
+            print(f"  [{tag}] {(event.data.get('content') or '')[:300]}", flush=True)
+    return any_text
+
+
 async def run_turn(
     runtime: Runtime, agent: Agent, question: str | None, state: AgentState | None, quiet: bool,
     sessions_dir: Path, answers: list[Answer] | None = None, *, chat_id: str | None = None,
@@ -391,6 +430,8 @@ async def run_turn(
     never shows an old question once the run has moved on.
     """
     store = runtime.store
+    # Live output only for a person at a terminal; piped output gets the finished answer only.
+    live = runtime.stream and not quiet and sys.stdout.isatty()
     while True:
         if store is not None:
             record = await store.get_chat(chat_id)
@@ -400,21 +441,26 @@ async def run_turn(
             before = len(state.messages) if state else 0
             execution = runtime.start(agent, question, state=state, answers=answers or ())
         start = before + (1 if question else 0)  # skip the user's own message
+        streamed = False
         try:
+            if live:
+                streamed = await print_live(execution)
             result = await execution.wait()
         except KeyboardInterrupt:
             logger.warning("exec=%s cancelling on Ctrl-C", execution.execution_id[:8])
             execution.cancel("Ctrl-C")
             result = await execution.wait()
-        if not quiet:
+        if not quiet and not live:
             print_transcript(result, start)
         if result.error:
             print(f"error [{result.error.code}]: {result.error.message}", file=sys.stderr)
         if result.persistence_error:
             print(f"warning: the chat could not be saved [{result.persistence_error.code}]: "
                   f"{result.persistence_error.message}", file=sys.stderr)
-        if result.output:
+        if result.output and not streamed:
             print(f"\n{result.output}\n")
+        elif streamed:
+            print()
         if not quiet:
             print_summary(result)
         if store is None and (session_path is not None or result.awaiting_input):
@@ -570,6 +616,8 @@ async def main() -> int:
                              "(default HARNESS_OWNER_ID)")
     parser.add_argument("--list", action="store_true", help="list saved chats (needs HARNESS_DATABASE_URL)")
     parser.add_argument("--show", metavar="ID", help="print a saved chat (needs HARNESS_DATABASE_URL)")
+    parser.add_argument("--no-stream", action="store_true",
+                        help="print the answer once it is complete instead of as it is written (HARNESS_STREAM=false)")
     args = parser.parse_args()
 
     try:
@@ -577,6 +625,8 @@ async def main() -> int:
         level = "DEBUG" if args.verbose else "WARNING" if args.quiet else (_env("HARNESS_LOG_LEVEL") or "INFO")
         setup_logging(level, _env("HARNESS_LOG_FILE"))
         config = load_config()
+        if args.no_stream:
+            config["stream"] = False
     except ConfigError as exc:
         print(f"config error: {exc}", file=sys.stderr)
         return 2
@@ -594,6 +644,7 @@ async def main() -> int:
         config["parallel_tools"], config["max_parallel_tools"], config["events_file"] or "none",
         config["print_events"], config["ask_user"], ",".join(sorted(config["approval_tools"])) or "none",
     )
+    logger.info("streaming: %s (idle timeout %.0fs)", config["stream"], config["stream_idle_timeout"])
     logger.info("persistence: %s (schema=%s lease=%.0fs owner=%s)",
                 "postgres" if config["database_url"] else f"session files in {config['sessions_dir']}",
                 config["db_schema"], config["lease_seconds"], args.owner or config["owner_id"] or "none")

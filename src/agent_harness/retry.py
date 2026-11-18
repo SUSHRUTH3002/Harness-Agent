@@ -3,21 +3,27 @@
 `ResilientLLMProvider` wraps any `LLMProvider`, so retry/timeout policy stays
 outside the agent loop (see design.md D10) -- the loop calls `generate()`
 exactly as it would on the inner provider.
+
+It streams too (Phase 8): `stream()` retries a stream that fails, even partway through. The
+pieces already passed on are then withdrawn with a `reset` piece (announced as `llm.stream_reset`),
+so whoever shows them clears the half answer before the retry streams it again.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import random
 import time
-from typing import Awaitable, Callable
+from typing import AsyncIterator, Awaitable, Callable
 
 from pydantic import BaseModel, Field
 
 from agent_harness.errors import ErrorCode, LLMError
 from agent_harness.events import EventType, emit_event
-from agent_harness.llm import LLMProvider, LLMRequest, LLMResponse
+from agent_harness.llm import LLMProvider, LLMRequest, LLMResponse, LLMStreamEvent
+from agent_harness.streaming import open_stream, timed_stream
 
 logger = logging.getLogger(__name__)
 
@@ -53,8 +59,10 @@ class ResilientLLMProvider:
     """Wraps an `LLMProvider` with a per-attempt timeout and retry-with-backoff.
 
     `timeout` bounds each individual attempt; a timed-out attempt counts as a
-    retryable `LLMError(code=TIMEOUT)`. `sleep` is overridable so a caller can
-    substitute a faster clock without waiting out real backoff delays.
+    retryable `LLMError(code=TIMEOUT)`. `idle_timeout` (streaming only) bounds the
+    gap between two pieces once the answer has started; a stall is retried the same way.
+    `sleep` is overridable so a caller can substitute a faster clock without waiting
+    out real backoff delays.
     """
 
     def __init__(
@@ -63,11 +71,13 @@ class ResilientLLMProvider:
         *,
         policy: RetryPolicy | None = None,
         timeout: float | None = None,
+        idle_timeout: float | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self._llm = llm
         self.policy = policy or RetryPolicy()
         self.timeout = timeout
+        self.idle_timeout = idle_timeout
         self._sleep = sleep
 
     async def generate(self, request: LLMRequest) -> LLMResponse:
@@ -88,22 +98,50 @@ class ResilientLLMProvider:
             except LLMError as exc:
                 error = exc
 
-            elapsed = time.perf_counter() - started
-            if not self.policy.should_retry(error, attempt):
-                error.details.setdefault("attempts", attempt + 1)
-                logger.warning(
-                    "llm call failed permanently after %d attempt(s), %.2fs: [%s] %s",
-                    attempt + 1, elapsed, error.code, error.message,
-                )
-                raise error
-            delay = self.policy.delay_for(error, attempt)
-            attempt += 1
+            attempt = await self._before_retry(error, attempt, started)
+
+    async def stream(self, request: LLMRequest) -> AsyncIterator[LLMStreamEvent]:
+        """Stream with the same retry policy. A retry after pieces were passed on yields `reset` first."""
+        attempt = 0
+        while True:
+            started = time.perf_counter()
+            passed_on = 0
+            try:
+                # aclosing: if our consumer stops early (cancel), the model connection closes now.
+                async with contextlib.aclosing(timed_stream(open_stream(self._llm, request), total=self.timeout,
+                                                            idle=self.idle_timeout)) as pieces:
+                    async for event in pieces:
+                        passed_on += 1
+                        yield event
+                return
+            except asyncio.CancelledError:
+                raise
+            except LLMError as exc:
+                error = exc
+            attempt = await self._before_retry(error, attempt, started)
+            if passed_on:
+                yield LLMStreamEvent(kind="reset", attempt=attempt)
+
+    async def _before_retry(self, error: LLMError, attempt: int, started: float) -> int:
+        """Raise `error` if it should not be retried; otherwise announce the retry, wait, and
+        return the next attempt number."""
+        elapsed = time.perf_counter() - started
+        if not self.policy.should_retry(error, attempt):
+            error.details.setdefault("attempts", attempt + 1)
             logger.warning(
-                "llm call failed (attempt %d/%d, %.2fs): [%s] %s -- retrying in %.1fs",
-                attempt, self.policy.max_retries, elapsed, error.code, error.message, delay,
+                "llm call failed permanently after %d attempt(s), %.2fs: [%s] %s",
+                attempt + 1, elapsed, error.code, error.message,
             )
-            await emit_event(EventType.LLM_RETRYING, {
-                "attempt": attempt, "max_retries": self.policy.max_retries, "code": error.code,
-                "message": error.message, "delay": round(delay, 2), "elapsed": round(elapsed, 3),
-            })
-            await self._sleep(delay)
+            raise error
+        delay = self.policy.delay_for(error, attempt)
+        attempt += 1
+        logger.warning(
+            "llm call failed (attempt %d/%d, %.2fs): [%s] %s -- retrying in %.1fs",
+            attempt, self.policy.max_retries, elapsed, error.code, error.message, delay,
+        )
+        await emit_event(EventType.LLM_RETRYING, {
+            "attempt": attempt, "max_retries": self.policy.max_retries, "code": error.code,
+            "message": error.message, "delay": round(delay, 2), "elapsed": round(elapsed, 3),
+        })
+        await self._sleep(delay)
+        return attempt

@@ -5,19 +5,24 @@ Switch providers by changing the model string, e.g. "openai/<model>",
 Credentials come from the provider's usual environment variables
 (OPENAI_API_KEY, ANTHROPIC_API_KEY, ...) or from `api_key` / `api_base`.
 
+Streams too (Phase 8): `stream()` sends `stream=True` and turns the OpenAI-style chunks into
+neutral `LLMStreamEvent`s (`openai_stream_events`, shared with the local provider).
+
 Requires the optional extra:  pip install 'agent-harness[litellm]'
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import time
-from typing import Any, Awaitable, Callable
+from typing import Any, AsyncIterator, Awaitable, Callable
 
 from agent_harness.errors import ErrorCode, LLMError
-from agent_harness.llm import FinishReason, LLMRequest, LLMResponse, ToolSchema, Usage
+from agent_harness.llm import FinishReason, LLMRequest, LLMResponse, LLMStreamEvent, ToolSchema, Usage
 from agent_harness.messages import Message, Role, ToolCall, new_id
+from agent_harness.streaming import close_iterator
 
 logger = logging.getLogger(__name__)
 
@@ -162,6 +167,71 @@ def from_litellm_response(response: Any, cost: float | None = None) -> LLMRespon
     )
 
 
+def _finish_reason(raw: Any) -> FinishReason:
+    if raw == "length":
+        return FinishReason.LENGTH
+    if raw in ("tool_calls", "function_call"):
+        return FinishReason.TOOL_CALLS
+    return FinishReason.STOP
+
+
+async def openai_stream_events(
+    chunks: Any, *, cost: Callable[[Usage], float | None] | None = None
+) -> AsyncIterator[LLMStreamEvent]:
+    """OpenAI-style streamed chunks (LiteLLM, the openai SDK) -> neutral stream pieces.
+
+    Each chunk carries `choices[0].delta` with `content` text and/or `tool_calls` fragments
+    (`index`, then `id`/`function.name` once and `function.arguments` in pieces), a
+    `finish_reason` at the end, and, when asked for, `usage` in a final chunk. Errors while
+    reading become `LLMError`s; an empty or unfinished stream fails like an empty response,
+    so the retry wrapper retries it. The chunk stream is always closed when this ends.
+    """
+    finish: Any = None
+    usage: Usage | None = None
+    model: str | None = None
+    produced = False
+    try:
+        async for chunk in chunks:
+            model = model or _get(chunk, "model")
+            raw_usage = _get(chunk, "usage")
+            if raw_usage is not None and (_get(raw_usage, "prompt_tokens") or _get(raw_usage, "completion_tokens")):
+                usage = _usage(chunk, None)
+            for choice in _get(chunk, "choices") or []:
+                if (_get(choice, "index", 0) or 0) != 0:
+                    continue
+                delta = _get(choice, "delta")
+                text = _get(delta, "content")
+                if text:
+                    produced = True
+                    yield LLMStreamEvent(kind="text", text=text)
+                for tc in _get(delta, "tool_calls") or []:
+                    function = _get(tc, "function")
+                    arguments = _get(function, "arguments")
+                    if isinstance(arguments, dict):  # a few providers send parsed arguments
+                        arguments = json.dumps(arguments)
+                    produced = True
+                    yield LLMStreamEvent(kind="tool_call", index=_get(tc, "index", 0) or 0, call_id=_get(tc, "id"),
+                                         name=_get(function, "name"), arguments=arguments or "")
+                if _get(choice, "finish_reason"):
+                    finish = _get(choice, "finish_reason")
+    except LLMError:
+        raise
+    except Exception as exc:
+        raise map_error(exc) from exc
+    finally:
+        await close_iterator(chunks)
+    if finish is None:
+        raise LLMError("the response stream ended before the model finished", code=ErrorCode.TRANSPORT,
+                       retryable=True)
+    if not produced and finish != "length":
+        raise LLMError("provider returned an empty response", code=ErrorCode.EMPTY_RESPONSE, retryable=True)
+    if usage is not None:
+        if cost is not None:
+            usage = usage.model_copy(update={"cost_usd": cost(usage)})
+        yield LLMStreamEvent(kind="usage", usage=usage)
+    yield LLMStreamEvent(kind="finish", finish_reason=_finish_reason(finish), model=model)
+
+
 class LiteLLMProvider:
     """`LLMProvider` backed by `litellm.acompletion`.
 
@@ -178,9 +248,11 @@ class LiteLLMProvider:
         api_base: str | None = None,
         timeout: float | None = None,
         drop_params: bool = True,
+        stream_usage: bool = True,
         completion_fn: CompletionFn | None = None,
         **default_params: Any,
     ) -> None:
+        self._cost_per_token: Callable[..., Any] | None = None
         if completion_fn is None:
             try:
                 import litellm
@@ -189,7 +261,10 @@ class LiteLLMProvider:
                     "LiteLLMProvider requires the 'litellm' extra: pip install 'agent-harness[litellm]'"
                 ) from exc
             completion_fn = litellm.acompletion
+            self._cost_per_token = litellm.cost_per_token
         self.model = model
+        # Ask for token counts at the end of a stream (OpenAI's stream_options.include_usage).
+        self.stream_usage = stream_usage
         self._completion = completion_fn
         self._params: dict[str, Any] = dict(default_params)
         # drop_params lets one agent config work across providers that don't support every setting.
@@ -198,7 +273,7 @@ class LiteLLMProvider:
             if value is not None:
                 self._params[key] = value
 
-    async def generate(self, request: LLMRequest) -> LLMResponse:
+    def _kwargs(self, request: LLMRequest) -> dict[str, Any]:
         model = request.model or self.model
         if not model:
             raise LLMError("no model configured: set Agent.model or LiteLLMProvider(model=...)",
@@ -208,10 +283,19 @@ class LiteLLMProvider:
         kwargs["messages"] = to_litellm_messages(request.messages)
         if request.tools:
             kwargs["tools"] = to_litellm_tools(request.tools)
+        return kwargs
+
+    @staticmethod
+    def _log_request(kwargs: dict[str, Any], streaming: bool) -> None:
         # Never log api_key: only the non-secret settings are listed.
         settings = {k: v for k, v in kwargs.items() if k not in _UNLOGGED_PARAMS}
-        logger.debug("litellm request: model=%s messages=%d tools=%d settings=%s",
-                     model, len(kwargs["messages"]), len(kwargs.get("tools", ())), settings)
+        logger.debug("litellm request%s: model=%s messages=%d tools=%d settings=%s", " (stream)" if streaming else "",
+                     kwargs["model"], len(kwargs["messages"]), len(kwargs.get("tools", ())), settings)
+
+    async def generate(self, request: LLMRequest) -> LLMResponse:
+        kwargs = self._kwargs(request)
+        model = kwargs["model"]
+        self._log_request(kwargs, False)
         started = time.perf_counter()
 
         try:
@@ -231,6 +315,48 @@ class LiteLLMProvider:
             f"${result.usage.cost_usd:.6f}" if result.usage.cost_usd is not None else "n/a",
         )
         return result
+
+    async def stream(self, request: LLMRequest) -> AsyncIterator[LLMStreamEvent]:
+        kwargs = self._kwargs(request)
+        model = kwargs["model"]
+        kwargs["stream"] = True
+        if self.stream_usage:
+            kwargs.setdefault("stream_options", {"include_usage": True})
+        self._log_request(kwargs, True)
+        started = time.perf_counter()
+        try:
+            chunks = await self._completion(**kwargs)
+        except LLMError:
+            raise
+        except Exception as exc:
+            error = map_error(exc)
+            logger.warning("litellm stream to %s failed after %.2fs: [%s] retryable=%s %s", model,
+                           time.perf_counter() - started, error.code, error.retryable, error.details)
+            raise error from exc
+        pieces = 0
+        try:
+            async with contextlib.aclosing(openai_stream_events(chunks, cost=lambda u: self._stream_cost(model, u))) \
+                    as events:
+                async for event in events:
+                    pieces += 1
+                    yield event
+        except LLMError as error:
+            logger.warning("litellm stream from %s failed after %.2fs and %d piece(s): [%s] retryable=%s %s", model,
+                           time.perf_counter() - started, pieces, error.code, error.retryable, error.message)
+            raise
+        logger.debug("litellm stream from %s finished in %.2fs (%d pieces)", model, time.perf_counter() - started,
+                     pieces)
+
+    def _stream_cost(self, model: str, usage: Usage) -> float | None:
+        """Price of a streamed response from its reported token counts (streams carry no cost)."""
+        if self._cost_per_token is None:
+            return None
+        try:
+            prompt_cost, completion_cost = self._cost_per_token(
+                model=model, prompt_tokens=usage.input_tokens, completion_tokens=usage.output_tokens)
+            return float(prompt_cost) + float(completion_cost)
+        except Exception:  # unknown model price: report no cost rather than fail the answer
+            return None
 
     @staticmethod
     def _cost(response: Any) -> float | None:

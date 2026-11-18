@@ -10,7 +10,7 @@
 | 5 | Event system | **Done** (`EventBus` + per-run observers, open dotted event types, `emit_event` from anywhere in a run via a context variable, ordered `seq`, isolated observers, `JsonlEventWriter` / `PrintObserver`) | Yes |
 | 6 | Observability | Not started | Yes |
 | 7 | Large result handling | **Done** (offload oversized/combined results to an `ArtifactStore` + `read_artifact`; no "summarize" strategy, see outcome notes) | Likely |
-| 8 | Streaming | Not started | Likely |
+| 8 | Streaming | **Done** (`StreamingLLMProvider.stream()` with neutral `LLMStreamEvent`s for LiteLLM and local servers; one `StreamAssembler` builds the same `LLMResponse` as before; transient `llm.token` / `llm.tool_call_delta` / `llm.stream_reset` events, never saved; retry restarts a failed stream with a reset; idle timeout after the first piece; `Execution.events()` for live reading; CLI prints as the model writes, `--no-stream`) | Yes (a chat UI needs it) |
 | 9 | Persistence | **Done** (`PersistenceStore` with `InMemoryStore` and `PostgresStore`; the runtime saves at start, after each continuing step and at the end whatever the status; chats load by id and list by owner (user, incident, ...); a lease allows one run per chat and recovers crashed runs without re-running their tool calls; fork for edit/regenerate) | Yes |
 | 10 | Compaction | **Done** (80% trigger, rolling evidence-preserving summary, each region archived to the `ArtifactStore`, real-usage measurement, compact-and-retry on provider overflow) | Yes (long RCA/debugging sessions) |
 | 11 | Subagents | Not started | Evaluate |

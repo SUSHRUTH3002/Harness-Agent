@@ -211,6 +211,20 @@ Status: Phase 0 proposal. Each phase ends with a **validation gate**: unit tests
 
 **Tests:** event ordering during streaming; token events are never passed to persistence.
 
+### Phase 8 outcome
+
+Decisions taken at the review gate (2026-11-18): a stream that fails partway is **discarded and retried** (with an `llm.stream_reset` event); an **idle timeout** (30s) bounds gaps between pieces on top of the overall limit; the CLI **streams by default** in a terminal (`--no-stream` to turn off); a slow `events()` reader **drops old pieces**, never durable events; `Execution.events()` is **in this phase**; a provider that reports no token counts gives **"usage unknown"**, never an estimate. The chat API (SSE) and UI are a later phase. Design: `docs/phase-8-streaming-design.md`.
+
+- **Vocabulary** (`llm.py`): `LLMStreamEvent` with kinds `text`, `tool_call` (index, id/name once, argument fragments), `usage`, `finish` (optionally carrying a whole `LLMResponse`) and `reset`. `StreamingLLMProvider` is an `LLMProvider` with `stream()`; `generate()` stays. `LLMResponse.usage_reported` is False when the provider sent no counts.
+- **One code path** (`streaming.py`): `StreamAssembler` builds the response. Tool-call arguments are joined as text and parsed only at the end; a piece naming a different call id under the same index starts a new call (some providers number every call 0). `open_stream()` replays a non-streaming provider's whole response as pieces, so callers never special-case it. `timed_stream()` adds the idle and total timeouts and always closes the source.
+- **Providers**: LiteLLM and the local provider share `openai_stream_events()` (OpenAI-style chunks to pieces, `stream_options.include_usage`, errors mapped to neutral `LLMError`s; an empty or unfinished stream fails retryably). LiteLLM prices a stream from its reported tokens (`litellm.cost_per_token`); local servers report no cost.
+- **Retries** (`retry.py`): `ResilientLLMProvider.stream()` uses the same policy; after pieces were passed on, a retry yields `reset` first. `idle_timeout` counts from the first piece: waiting for the first one is bounded by the provider/request timeout instead, because thinking models can be silent for several seconds (Gemini: ~6s observed) before writing.
+- **Loop**: with `LoopDependencies.stream`, `_call_llm` reads pieces, emits the transient events, and assembles the response; everything after the call (tools, compaction measurement, persistence, HITL) is unchanged. Cancelling closes the model connection.
+- **Runtime**: `Runtime(stream=True)` by default. `Execution.events()` is fed by an `EventStream` observer attached at `start()`, so nothing is missed by a late reader; it ends when the run's task ends. Transient events are capped (2000 by default, oldest dropped, `Execution.dropped_events`).
+- **Events**: `PrintObserver` skips `llm.token` by default; `JsonlEventWriter` and the stores already skip transient events.
+- **Deviations from the plan**: errors are raised from the stream as neutral `LLMError`s (the Python form of "errors arrive in the stream"); no test suite (per the standing instruction): verified with scratchpad scripts (12 streaming scenarios; Phase 5, 9 and 12b checks re-run, Phase 9 on InMemory and Postgres) and a live Gemini run.
+- **Known limit**: streamed pieces are not stored, so a client that disconnects mid-answer reloads the chat and sees the finished answer, not the words it missed.
+
 ## Phase 9: Persistence
 
 **Build:**

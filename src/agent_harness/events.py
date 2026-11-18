@@ -67,6 +67,10 @@ class EventType:
     INTERACTION_REQUESTED = "interaction.requested"
     INTERACTION_RESOLVED = "interaction.resolved"
     CHECKPOINT_SAVED = "checkpoint.saved"
+    # Streaming (Phase 8). All transient: shown live, never saved.
+    LLM_TOKEN = "llm.token"
+    LLM_TOOL_CALL_DELTA = "llm.tool_call_delta"
+    LLM_STREAM_RESET = "llm.stream_reset"
 
 
 class Event(BaseModel):
@@ -283,11 +287,16 @@ class JsonlEventWriter:
 class PrintObserver:
     """One compact line per event, for watching a run live in the terminal."""
 
-    def __init__(self, stream: TextIO | None = None, *, max_value_chars: int = 80) -> None:
+    def __init__(self, stream: TextIO | None = None, *, max_value_chars: int = 80,
+                 skip: Iterable[str] = ("llm.token",)) -> None:
         self.stream = stream
         self.max_value_chars = max_value_chars
+        # One line per streamed piece would flood the terminal; pass skip=() to see them.
+        self.skip = tuple(skip)
 
     async def on_event(self, event: Event) -> None:
+        if any(fnmatch.fnmatchcase(event.type, pattern) for pattern in self.skip):
+            return
         fields = " ".join(f"{k}={self._short(v)}" for k, v in event.data.items())
         step = f" step={event.step}" if event.step else ""
         print(f"[event] exec={short_id(event.execution_id)} #{event.seq}{step} {event.type} {fields}".rstrip(),

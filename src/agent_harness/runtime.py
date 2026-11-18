@@ -13,7 +13,8 @@ import asyncio
 import contextlib
 import logging
 import time
-from typing import Any, Iterable, Sequence
+from collections import deque
+from typing import Any, AsyncIterator, Iterable, Sequence
 
 from pydantic import BaseModel
 
@@ -22,7 +23,15 @@ from agent_harness.cancellation import CancellationToken
 from agent_harness.compaction import Compactor
 from agent_harness.context import ContextManager, DefaultContextManager
 from agent_harness.errors import ErrorCode, ErrorInfo, HarnessError, ValidationError
-from agent_harness.events import EventBus, EventType, ObserverLike, RunEmitter, bind_emitter, unbind_emitter
+from agent_harness.events import (
+    Event,
+    EventBus,
+    EventType,
+    ObserverLike,
+    RunEmitter,
+    bind_emitter,
+    unbind_emitter,
+)
 from agent_harness.executor import SequentialToolExecutor, ToolExecutor
 from agent_harness.hitl import Answer, Interaction, pending_interactions, submit_answers, take_held
 from agent_harness.hooks import Hooks
@@ -108,6 +117,59 @@ def _recover_interrupted(state: AgentState) -> None:
                             message="The previous run stopped without finishing (its process ended).")
 
 
+class EventStream:
+    """The events of one run, queued for `Execution.events()` (Phase 8).
+
+    Attached as the run's own observer when the run starts, so nothing emitted before the caller
+    starts reading is missed. Durable events are always kept. Transient ones (streamed pieces,
+    `llm.token`, ...) are capped at `max_transient`: if the reader falls behind, the oldest
+    are dropped -- the finished answer still arrives whole in `llm.completed` and the result.
+    """
+
+    def __init__(self, *, max_transient: int = 2000) -> None:
+        self.max_transient = max_transient
+        self.dropped = 0
+        self._queue: deque[Event] = deque()
+        self._transient = 0
+        self._closed = False
+        self._wakeup = asyncio.Event()
+
+    async def on_event(self, event: Event) -> None:
+        if self._closed:
+            return
+        if event.transient:
+            if self._transient >= self.max_transient:
+                self._drop_oldest_transient()
+            self._transient += 1
+        self._queue.append(event)
+        self._wakeup.set()
+
+    def _drop_oldest_transient(self) -> None:
+        for i, queued in enumerate(self._queue):
+            if queued.transient:
+                del self._queue[i]
+                self._transient -= 1
+                self.dropped += 1
+                return
+
+    def close(self) -> None:
+        self._closed = True
+        self._wakeup.set()
+
+    async def __aiter__(self) -> AsyncIterator[Event]:
+        while True:
+            if self._queue:
+                event = self._queue.popleft()
+                if event.transient:
+                    self._transient -= 1
+                yield event
+                continue
+            if self._closed:
+                return
+            self._wakeup.clear()
+            await self._wakeup.wait()
+
+
 class Execution:
     """A running (or finished) agent run, with the ability to cancel it.
 
@@ -121,10 +183,37 @@ class Execution:
     `Runtime._execute`.
     """
 
-    def __init__(self, task: asyncio.Task[RunResult], cancel_token: CancellationToken, execution_id: str) -> None:
+    def __init__(self, task: asyncio.Task[RunResult], cancel_token: CancellationToken, execution_id: str,
+                 events: EventStream | None = None) -> None:
         self._task = task
         self._cancel_token = cancel_token
         self.execution_id = execution_id
+        self._events = events or EventStream()
+        if events is None:
+            self._events.close()
+        else:
+            # The run's last event is emitted inside the task, so closing when it ends loses nothing.
+            task.add_done_callback(lambda _: self._events.close())
+
+    def events(self) -> AsyncIterator[Event]:
+        """This run's events as they happen, ending when the run ends (one reader per run).
+
+            execution = runtime.start(agent, "Why is db-3 slow?")
+            async for event in execution.events():
+                if event.type == "llm.token":
+                    print(event.data["text"], end="", flush=True)
+            result = await execution.wait()
+
+        `llm.stream_reset` means a retry started: forget the text shown since the last answer began.
+        A run that fails to start (e.g. its chat is already running) ends the iteration with no
+        events; `wait()` then raises the reason.
+        """
+        return aiter(self._events)
+
+    @property
+    def dropped_events(self) -> int:
+        """Streamed pieces dropped because `events()` was read too slowly."""
+        return self._events.dropped
 
     def cancel(self, reason: str | None = None) -> None:
         self._cancel_token.cancel(reason)
@@ -152,6 +241,7 @@ class Runtime:
         events: EventBus | None = None,
         store: PersistenceStore | None = None,
         lease_seconds: float = DEFAULT_LEASE_SECONDS,
+        stream: bool = True,
     ) -> None:
         if not isinstance(llm, LLMProvider):
             raise TypeError("llm must implement LLMProvider (an async generate(request) method)")
@@ -174,6 +264,9 @@ class Runtime:
         self.store = store
         # How long a run holds its chat without renewing (renewed every third of it while alive).
         self.lease_seconds = lease_seconds
+        # Stream model answers (Phase 8): pieces arrive as transient llm.token events (see
+        # Execution.events()). Results are identical either way; False makes one plain call per step.
+        self.stream = stream
 
     def start(
         self,
@@ -248,6 +341,8 @@ class Runtime:
         if state is not None and chat_id is not None and state.execution_id != chat_id:
             raise ValidationError(f"state is chat '{state.execution_id}', not '{chat_id}'", code=ErrorCode.INVALID_CONFIG)
         cancel_token = CancellationToken()
+        stream = EventStream()
+        observers = [*observers, stream]
         if self.store is None:
             if owner_id is not None or metadata:
                 raise ValidationError("owner_id and metadata are kept by a PersistenceStore; this Runtime has none",
@@ -259,7 +354,7 @@ class Runtime:
                 state=state, parent_execution_id=parent_execution_id,
             )
             task = asyncio.ensure_future(self._execute(agent, state, cancel_token, emitter, resumed=resumed))
-            return Execution(task, cancel_token, state.execution_id)
+            return Execution(task, cancel_token, state.execution_id, stream)
 
         self._normalize_input(input)  # report malformed input now rather than from inside the task
         chat_id = chat_id or (state.execution_id if state is not None else new_id())
@@ -267,7 +362,7 @@ class Runtime:
             agent, input, state, chat_id, owner_id, metadata, answers, cancel_token, observers, parent_execution_id,
             require_awaiting,
         ))
-        return Execution(task, cancel_token, chat_id)
+        return Execution(task, cancel_token, chat_id, stream)
 
     async def _execute_stored(
         self, agent: Agent, input: RunInput | None, given: AgentState | None, chat_id: str, owner_id: str | None,
@@ -345,6 +440,7 @@ class Runtime:
             llm=self.llm, context=self.context_manager, executor=self.tool_executor, registry=registry,
             cancel=cancel_token, hooks=self.hooks, result_processor=self.result_processor,
             compactor=self.compactor, checkpoint=persist.checkpoint if persist is not None else None,
+            stream=self.stream,
         )
         exec_id = short_id(state.execution_id)
         logger.info(

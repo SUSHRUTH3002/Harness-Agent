@@ -57,7 +57,16 @@ from agent_harness.hitl import (
 )
 from agent_harness.hitl import answer, approve, edit, reject
 from agent_harness.hooks import Hooks, StepDecision, StopDecision, ToolDecision, allow, ask, deny
-from agent_harness.llm import FinishReason, LLMProvider, LLMRequest, LLMResponse, ToolSchema, Usage
+from agent_harness.llm import (
+    FinishReason,
+    LLMProvider,
+    LLMRequest,
+    LLMResponse,
+    LLMStreamEvent,
+    StreamingLLMProvider,
+    ToolSchema,
+    Usage,
+)
 from agent_harness.loop import AgentLoop, LoopDependencies
 from agent_harness.messages import Message, Role, TextPart, ToolCall, ToolCallPart
 from agent_harness.persistence import (
@@ -73,9 +82,10 @@ from agent_harness.persistence import (
 from agent_harness.registry import ToolRegistry
 from agent_harness.results import ArtifactStore, FileArtifactStore, InMemoryArtifactStore, LargeResultProcessor, make_read_artifact_tool
 from agent_harness.retry import RetryPolicy, ResilientLLMProvider
-from agent_harness.runtime import Execution, RunResult, Runtime
+from agent_harness.runtime import EventStream, Execution, RunResult, Runtime
 from agent_harness.state import AgentState, RunStatus
 from agent_harness.stores.memory import InMemoryStore
+from agent_harness.streaming import StreamAssembler, open_stream
 from agent_harness.tools import FunctionTool, Tool, ToolAnnotations, ToolContext, ToolResult, tool
 
 __all__ = [
@@ -97,6 +107,7 @@ __all__ = [
     "ErrorInfo",
     "Event",
     "EventBus",
+    "EventStream",
     "EventType",
     "Execution",
     "ExecutionError",
@@ -116,6 +127,7 @@ __all__ = [
     "LLMProvider",
     "LLMRequest",
     "LLMResponse",
+    "LLMStreamEvent",
     "LargeResultProcessor",
     "Lease",
     "LoopDependencies",
@@ -139,6 +151,8 @@ __all__ = [
     "StepDecision",
     "StopDecision",
     "StoredMessage",
+    "StreamAssembler",
+    "StreamingLLMProvider",
     "Subscription",
     "TextPart",
     "TokenCounter",
@@ -169,6 +183,7 @@ __all__ = [
     "fork_state",
     "make_ask_user_tool",
     "make_read_artifact_tool",
+    "open_stream",
     "pending_interactions",
     "reject",
     "tool",
