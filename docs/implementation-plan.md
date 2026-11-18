@@ -362,3 +362,21 @@ Decisions taken at the review gate (2026-11-17): the chat id **is** `AgentState.
 - A `LoopStrategy` protocol.
 - Documentation of every extension point.
 - An audit showing that each earlier extension can be expressed as a plugin.
+
+## Phase 17: Chat API and Web UI
+
+*Added 2026-11-18. Called "Phase 11a/11b" while it was designed; Phase 11 remains Subagents. Design: [phase-17-chat-api-ui-design.md](phase-17-chat-api-ui-design.md).*
+
+**Build:** 17a, an HTTP + WebSocket API over the runtime and the persistence store; 17b, a web chat that uses it.
+
+### Phase 17a outcome (Chat API)
+
+- **New package `agent_harness/api/`** (extra `api`: FastAPI, uvicorn): `models.py`, `broadcast.py` (`RunBroadcast`), `service.py` (`ChatService`, framework-free), `server.py` (`create_app`). Entry point `api_main.py`. **No core file changed**; the package is not exported from `agent_harness/__init__.py`, so the core still depends only on pydantic.
+- **Routes**: health, create/list/get/rename/delete chats, `POST .../messages` (202 after `run.started`), `POST .../answers` (HITL), `POST .../cancel`, and `WS .../stream?after_seq=N`.
+- **Live stream**: a `RunBroadcast` is attached to each run as an observer and keeps its events, so several clients, late joiners and reconnects (`after_seq`) all work. Durable events are always kept; streamed pieces are capped (5000) and a reader that missed dropped ones gets `stream.gap`. Frames are the events as JSON, plus `stream.idle` / `stream.gap` / `stream.end`.
+- **Callers**: optional bearer token (`HARNESS_API_TOKEN`; browsers authenticate a WebSocket with a first frame), `X-Owner-Id` scoping (trusted, set by a gateway; other owners get 404), WebSocket Origin check, CORS allow-list, 429 at `HARNESS_API_MAX_ACTIVE_RUNS`, default listen address `127.0.0.1`.
+- **Behaviour**: one run per chat (409 otherwise; the store lease covers other processes); starting errors (chat busy elsewhere, invalid answers, database down) return as 409/422/503 instead of a silent failed stream; disconnecting never stops a run; shutdown cancels active runs, which save as `cancelled`.
+- **Deviations from the first sketch** (see the design doc): runs are addressed by chat id; answers go to `/chats/{id}/answers`; `RunBroadcast` instead of `Execution.events()` (one reader); `service.py` instead of `handlers.py`/`websocket.py`; `cancel`, `PATCH`, `DELETE`, `health` added.
+- **No test suite** (explicit instruction). Verified with 16 scripted scenarios against a real uvicorn server (REST + WebSocket clients): lifecycle and live tokens, replay and `after_seq`, two clients and a mid-run reconnect, one-run-per-chat / cancel / disconnect, `stream.idle`, validation, rename/archive/delete/paging, the HITL round trip (including bad answers leaving the chat waiting), token auth (header and first frame), owner scoping, Origin and CORS, 429 and a chat busy in another process, retiring finished runs, shutdown saving `cancelled`, and the broadcast buffer/`Gap`. Live: the server against Gemini and Postgres, a tool call and 6 streamed pieces, saved chat identical to the streamed text.
+- **Known limits**: active runs live in one process (sticky routing with several); no user login or per-user tokens (owner header is trusted); no fork route yet.
+

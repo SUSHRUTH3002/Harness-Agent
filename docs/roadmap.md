@@ -20,6 +20,7 @@
 | 14 | Safety & governance | Not started | Evaluate |
 | 15 | Replay | Not started | Evaluate after 9 |
 | 16 | Plugin architecture | Not started | Formalize what exists |
+| 17 | Chat API and Web UI | **17a Chat API done** (FastAPI + WebSocket over `Runtime`/`PersistenceStore`: chats, messages, HITL answers, cancel, live replayable run stream, bearer token, owner scoping); 17b Web UI designed, not started. Called "Phase 11a/11b" in conversation; Phase 11 stays Subagents | Yes |
 
 ## Phase 0 review decisions
 
